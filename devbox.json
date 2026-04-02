@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.0/.schema/devbox.schema.json",
+  "packages": [
+    "go@latest"
+  ],
+  "shell": {
+    "init_hook": [
+      "echo 'Go dev environment ready. Run `go mod init` to start a new module.'"
+    ],
+    "scripts": {
+      "build": "go build ./...",
+      "test": "go test ./...",
+      "run": "go run ."
+    }
+  }
+}
