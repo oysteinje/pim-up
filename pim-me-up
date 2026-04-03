@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# pim-me-up — Fast Azure PIM activation from the terminal
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Constants & Configuration
+# -----------------------------------------------------------------------------
+
+PIM_API="https://api.azrbac.mspim.azure.com"
+ARM_API="https://management.azure.com"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+# Duration options (hours)
+DURATION_OPTIONS=("1h" "2h" "4h" "8h")
+
+# fzf configuration — dynamic height (~) requires fzf 0.30+
+if [[ "$(fzf --version 2>/dev/null | cut -d. -f1-2)" > "0.29" ]]; then
+    FZF_COMMON="--height=~50% --border --margin=1,2"
+else
+    FZF_COMMON="--height=50% --border --margin=1,2"
+fi
+FZF_SINGLE="$FZF_COMMON --no-multi"
+FZF_MULTI="$FZF_COMMON --multi --bind=space:toggle,ctrl-a:toggle-all"
+
+# Session state
+USER_ID=""
+
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
+
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    printf "${RED}Error: %s${NC}\n" "$msg" >&2
+    exit "$code"
+}
+
+check_deps() {
+    local missing=()
+    local deps=(fzf jq az curl)
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing required dependencies: $(IFS=', '; echo "${missing[*]}")"
+    fi
+}
+
+get_user_id() {
+    local user_json
+    if ! user_json=$(az ad signed-in-user show 2>/dev/null); then
+        die "Run \`az login\` first"
+    fi
+
+    USER_ID=$(echo "$user_json" | jq -r '.id')
+    if [[ -z "$USER_ID" || "$USER_ID" == "null" ]]; then
+        die "Failed to retrieve user ID from Azure AD"
+    fi
+
+    local org_json
+    org_json=$(az rest --method GET --url "https://graph.microsoft.com/v1.0/organization" 2>/dev/null) || true
+    local tenant_name
+    tenant_name=$(echo "$org_json" | jq -r '.value[0].displayName // empty' 2>/dev/null) || tenant_name=""
+
+    if [[ -z "$tenant_name" ]]; then
+        local account_json
+        account_json=$(az account show 2>/dev/null) || true
+        tenant_name=$(echo "$account_json" | jq -r '.tenantDisplayName // .name // "unknown"' 2>/dev/null) || tenant_name="unknown"
+    fi
+
+    printf "${GREEN}Logged in${NC} — Tenant: %s\n" "$tenant_name"
+}
+
+gen_uuid() {
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        uuidgen || die "Cannot generate UUID — install uuidgen or run on Linux"
+    fi
+}
+
+iso_now() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# -----------------------------------------------------------------------------
+# API Functions
+# -----------------------------------------------------------------------------
+
+# (Added by later stories)
+
+# -----------------------------------------------------------------------------
+# Display Formatting
+# -----------------------------------------------------------------------------
+
+# (Added by later stories)
+
+# -----------------------------------------------------------------------------
+# UI Flow Functions
+# -----------------------------------------------------------------------------
+
+# (Added by later stories)
+
+# -----------------------------------------------------------------------------
+# Activation Orchestration
+# -----------------------------------------------------------------------------
+
+# (Added by later stories)
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+    check_deps
+    get_user_id
+
+    # Future stories add: active assignment display, category picker, etc.
+}
+
+main "$@"
