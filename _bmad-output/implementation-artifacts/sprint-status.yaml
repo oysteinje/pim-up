@@ -45,7 +45,7 @@ development_status:
   # Epic 1: Script Foundation & Startup
   epic-1: in-progress
   1-1-dependency-check-and-script-bootstrap: done
-  1-2-active-assignment-display: backlog
+  1-2-active-assignment-display: review
   1-3-category-picker-and-navigation-shell: backlog
   epic-1-retrospective: optional
 

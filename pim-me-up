@@ -100,19 +100,118 @@ iso_now() {
 # API Functions
 # -----------------------------------------------------------------------------
 
-# (Added by later stories)
+fetch_active_pim() {
+    local category="$1"  # "aadroles" or "aadGroups"
+    local result
+    result=$(az rest --resource "$PIM_API" --method GET \
+        --url "$PIM_API/api/v2/privilegedAccess/$category/roleAssignments?\$filter=subjectId eq '$USER_ID' and assignmentState eq 'Active'" \
+        2>/dev/null) || { echo '{"value":[]}'; return 0; }
+    echo "$result"
+}
+
+fetch_active_arm() {
+    local result
+    result=$(az rest --method GET \
+        --url "$ARM_API/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?\$filter=asTarget()&api-version=2020-10-01" \
+        2>/dev/null) || { echo '{"value":[]}'; return 0; }
+    echo "$result"
+}
 
 # -----------------------------------------------------------------------------
 # Display Formatting
 # -----------------------------------------------------------------------------
 
-# (Added by later stories)
+format_pim_roles() {
+    local json="$1"
+    jq -r '.value[].roleDefinition.displayName // empty' <<< "$json" 2>/dev/null
+}
+
+format_pim_groups() {
+    local json="$1"
+    jq -r '.value[].roleDefinition.resource.displayName // empty' <<< "$json" 2>/dev/null
+}
+
+format_arm_roles() {
+    local json="$1"
+    jq -r '.value[] | (.properties.expandedProperties.roleDefinition.displayName // "unknown") + " (" + (.properties.expandedProperties.scope.displayName // "unknown") + ")"' <<< "$json" 2>/dev/null
+}
 
 # -----------------------------------------------------------------------------
 # UI Flow Functions
 # -----------------------------------------------------------------------------
 
-# (Added by later stories)
+show_active_assignments() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" RETURN
+
+    # Launch all three fetches in background
+    fetch_active_pim "aadroles" > "$tmpdir/entra" 2>/dev/null &
+    local pid_entra=$!
+    fetch_active_pim "aadGroups" > "$tmpdir/groups" 2>/dev/null &
+    local pid_groups=$!
+    fetch_active_arm > "$tmpdir/arm" 2>/dev/null &
+    local pid_arm=$!
+
+    # Wait up to 1 second using SECONDS-based polling
+    local deadline=$((SECONDS + 1))
+    while (( SECONDS < deadline )); do
+        # Check if all processes have finished
+        if ! kill -0 "$pid_entra" 2>/dev/null && \
+           ! kill -0 "$pid_groups" 2>/dev/null && \
+           ! kill -0 "$pid_arm" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    # If any still running, kill them and silently skip
+    local timed_out=false
+    for pid in $pid_entra $pid_groups $pid_arm; do
+        if kill -0 "$pid" 2>/dev/null; then
+            timed_out=true
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    wait "$pid_entra" "$pid_groups" "$pid_arm" 2>/dev/null || true
+
+    if $timed_out; then
+        return 0  # silently skip on timeout
+    fi
+
+    # Parse results
+    local entra_json groups_json arm_json
+    entra_json=$(<"$tmpdir/entra")
+    groups_json=$(<"$tmpdir/groups")
+    arm_json=$(<"$tmpdir/arm")
+
+    local entra_names groups_names arm_names
+    entra_names=$(format_pim_roles "$entra_json")
+    groups_names=$(format_pim_groups "$groups_json")
+    arm_names=$(format_arm_roles "$arm_json")
+
+    local entra_count groups_count arm_count total
+    entra_count=$(echo "$entra_names" | grep -c . 2>/dev/null) || entra_count=0
+    groups_count=$(echo "$groups_names" | grep -c . 2>/dev/null) || groups_count=0
+    arm_count=$(echo "$arm_names" | grep -c . 2>/dev/null) || arm_count=0
+    total=$((entra_count + groups_count + arm_count))
+
+    if (( total == 0 )); then
+        echo "No active PIM assignments"
+        return 0
+    fi
+
+    printf "${YELLOW}Active PIM Assignments:${NC}\n"
+    if (( entra_count > 0 )); then
+        printf "  Entra ID Roles (%d): %s\n" "$entra_count" "$(echo "$entra_names" | paste -sd', ')"
+    fi
+    if (( groups_count > 0 )); then
+        printf "  PIM Groups (%d): %s\n" "$groups_count" "$(echo "$groups_names" | paste -sd', ')"
+    fi
+    if (( arm_count > 0 )); then
+        printf "  Azure Resources (%d): %s\n" "$arm_count" "$(echo "$arm_names" | paste -sd', ')"
+    fi
+}
 
 # -----------------------------------------------------------------------------
 # Activation Orchestration
@@ -127,8 +226,9 @@ iso_now() {
 main() {
     check_deps
     get_user_id
+    show_active_assignments
 
-    # Future stories add: active assignment display, category picker, etc.
+    # Future stories add: category picker, etc.
 }
 
 main "$@"
