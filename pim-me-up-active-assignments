@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PIM_API="https://api.azrbac.mspim.azure.com"
+ARM_API="https://management.azure.com"
+
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+USER_ID=""
+
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    printf "${RED}Error: %s${NC}\n" "$msg" >&2
+    exit "$code"
+}
+
+check_deps() {
+    local missing=()
+    local deps=(jq az)
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing required dependencies: $(IFS=', '; echo "${missing[*]}")"
+    fi
+}
+
+get_user_id() {
+    local user_json
+    if ! user_json=$(az ad signed-in-user show 2>/dev/null); then
+        die "Run \`az login\` first"
+    fi
+
+    USER_ID=$(echo "$user_json" | jq -r '.id')
+    if [[ -z "$USER_ID" || "$USER_ID" == "null" ]]; then
+        die "Failed to retrieve user ID from Azure AD"
+    fi
+
+    printf "${GREEN}Logged in${NC}\n"
+}
+
+show_spinner() {
+    local pid="$1"
+    local message="$2"
+    local frames=('|' '/' '-' '\')
+    local i=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r%s %s" "$message" "${frames[i % ${#frames[@]}]}"
+        i=$(( i + 1 ))
+        sleep 0.1
+    done
+
+    wait "$pid"
+    local status=$?
+    printf "\r\033[K"
+    return "$status"
+}
+
+fetch_active_pim() {
+    local category="$1"  # "aadroles" or "aadGroups"
+    local result
+    result=$(az rest --resource "$PIM_API" --method GET \
+        --url "$PIM_API/api/v2/privilegedAccess/$category/roleAssignments?\$filter=subjectId eq '$USER_ID' and assignmentState eq 'Active'&\$expand=roleDefinition(\$expand=resource)" \
+        2>/dev/null) || { echo '{"value":[]}'; return 0; }
+    echo "$result"
+}
+
+fetch_active_arm() {
+    local subs
+    subs=$(az account list --query '[].id' -o tsv 2>/dev/null) || { echo '{"value":[]}'; return 0; }
+    [[ -z "$subs" ]] && { echo '{"value":[]}'; return 0; }
+
+    local arm_tmpdir
+    arm_tmpdir=$(mktemp -d)
+
+    local pids=()
+    while IFS= read -r sub_id; do
+        [[ -z "$sub_id" ]] && continue
+        (
+            az rest --method GET \
+                --url "$ARM_API/subscriptions/$sub_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?\$filter=asTarget()&api-version=2020-10-01" \
+                > "$arm_tmpdir/$sub_id" 2>/dev/null || rm -f "$arm_tmpdir/$sub_id"
+        ) &
+        pids+=($!)
+    done <<< "$subs"
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    if compgen -G "$arm_tmpdir/*" >/dev/null 2>&1; then
+        jq -s '{"value": [.[].value[]]}' "$arm_tmpdir"/* 2>/dev/null || echo '{"value":[]}'
+    else
+        echo '{"value":[]}'
+    fi
+
+    rm -rf "$arm_tmpdir"
+}
+
+format_pim_roles() {
+    local json="$1"
+    jq -r '.value[].roleDefinition.displayName // empty' <<< "$json" 2>/dev/null
+}
+
+format_pim_groups() {
+    local json="$1"
+    jq -r '.value[] |
+        ((.roleDefinition.resource.displayName // .resource.displayName // .resourceId // "unknown") +
+        (if (.roleDefinition.displayName // "") != "" then " (" + .roleDefinition.displayName + ")" else "" end))' <<< "$json" 2>/dev/null
+}
+
+format_arm_roles() {
+    local json="$1"
+    jq -r '.value[]
+        | select((.properties.endDateTime // "") != "")
+        | (.properties.expandedProperties.roleDefinition.displayName // "unknown") + " (" +
+        (.properties.expandedProperties.scope.displayName // "unknown") + ")"' <<< "$json" 2>/dev/null
+}
+
+count_nonempty_lines() {
+    local lines="$1"
+    awk 'NF { count++ } END { print count + 0 }' <<< "$lines"
+}
+
+print_assignment_section() {
+    local label="$1"
+    local items="$2"
+    local count="$3"
+
+    (( count > 0 )) || return 0
+
+    printf "  %s (%d)\n" "$label" "$count"
+    while IFS= read -r item; do
+        [[ -n "$item" ]] || continue
+        printf "    - %s\n" "$item"
+    done <<< "$items"
+}
+
+show_active_assignments() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" RETURN
+
+    fetch_active_pim "aadroles" > "$tmpdir/entra" 2>/dev/null &
+    local pid_entra=$!
+    fetch_active_pim "aadGroups" > "$tmpdir/groups" 2>/dev/null &
+    local pid_groups=$!
+    fetch_active_arm > "$tmpdir/arm" 2>/dev/null &
+    local pid_arm=$!
+
+    ( sleep 30; kill "$pid_entra" "$pid_groups" "$pid_arm" 2>/dev/null ) &
+    local pid_killer=$!
+    wait "$pid_entra" "$pid_groups" "$pid_arm" 2>/dev/null || true
+    kill "$pid_killer" 2>/dev/null || true
+    wait "$pid_killer" 2>/dev/null || true
+
+    local entra_json groups_json arm_json
+    entra_json=$(<"$tmpdir/entra")
+    groups_json=$(<"$tmpdir/groups")
+    arm_json=$(<"$tmpdir/arm")
+
+    local entra_names groups_names arm_names
+    entra_names=$(format_pim_roles "$entra_json")
+    groups_names=$(format_pim_groups "$groups_json")
+    arm_names=$(format_arm_roles "$arm_json")
+
+    local entra_count groups_count arm_count total
+    entra_count=$(count_nonempty_lines "$entra_names")
+    groups_count=$(count_nonempty_lines "$groups_names")
+    arm_count=$(count_nonempty_lines "$arm_names")
+    total=$((entra_count + groups_count + arm_count))
+
+    if (( total == 0 )); then
+        echo "No active assignments"
+        return 0
+    fi
+
+    printf "${YELLOW}Active Assignments:${NC}\n"
+    print_assignment_section "Entra ID Roles" "$entra_names" "$entra_count"
+    print_assignment_section "PIM Groups" "$groups_names" "$groups_count"
+    print_assignment_section "Azure Resources" "$arm_names" "$arm_count"
+}
+
+show_active_assignments_view() {
+    local tmpfile
+    tmpfile=$(mktemp)
+    trap 'rm -f "$tmpfile"' RETURN
+
+    show_active_assignments >"$tmpfile" 2>&1 &
+    local pid=$!
+
+    show_spinner "$pid" "Loading active assignments"
+    printf "\n"
+    cat "$tmpfile"
+}
+
+main() {
+    check_deps
+    get_user_id
+    show_active_assignments_view
+}
+
+main "$@"
