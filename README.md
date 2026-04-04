@@ -1,6 +1,6 @@
 # pim-me-up
 
-Fast Azure PIM elevation from your terminal using fzf.
+Fast Azure PIM elevation from your terminal using fzf (within the limits of the PIM API, which can be quite slow).
 
 Activate Entra ID roles, PIM groups, and Azure resource roles — all with fuzzy search and multi-select.
 
@@ -23,12 +23,15 @@ Activate Entra ID roles, PIM groups, and Azure resource roles — all with fuzzy
 ## Install
 
 ```bash
-# Clone and symlink to PATH
-git clone https://github.com/qbits/pim-me-up.git
-ln -s "$(pwd)/pim-me-up/pim-me-up" ~/.local/bin/pim-me-up
+# Quick install (user-local)
+curl -fsSL https://raw.githubusercontent.com/qbits/pim-me-up/main/install.sh | bash
 
-# Or just copy it
-cp pim-me-up /usr/local/bin/
+# System-wide install
+curl -fsSL https://raw.githubusercontent.com/qbits/pim-me-up/main/install.sh | bash -s -- --system
+
+# Manual install
+git clone https://github.com/qbits/pim-me-up.git
+install -m 755 pim-me-up/pim-me-up ~/.local/bin/pim-me-up
 ```
 
 ## Usage
