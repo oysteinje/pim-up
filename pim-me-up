@@ -22,7 +22,7 @@ NC='\033[0m' # No Color
 DURATION_OPTIONS=("1h" "2h" "4h" "8h")
 
 # fzf configuration — dynamic height (~) requires fzf 0.30+
-if [[ "$(fzf --version 2>/dev/null | cut -d. -f1-2)" > "0.29" ]]; then
+if fzf --height=~1 </dev/null >/dev/null 2>&1; then
     FZF_COMMON="--height=~50% --border --margin=1,2"
 else
     FZF_COMMON="--height=50% --border --margin=1,2"
@@ -30,10 +30,10 @@ fi
 FZF_SINGLE="$FZF_COMMON --no-multi"
 FZF_MULTI="$FZF_COMMON --multi --bind=space:toggle,ctrl-a:toggle-all"
 
-# fzf headers
-FZF_HEADER_CATEGORY="--header=Select PIM category (Esc to exit)"
-FZF_HEADER_ROLES="--header=Space/Tab=select  Enter=confirm  Ctrl-A=all  Esc=back"
-FZF_HEADER_DURATION="--header=Select activation duration (Esc=back)"
+# fzf headers — pass as: --header="$FZF_HEADER_*" (not bare, to avoid word splitting)
+FZF_HEADER_CATEGORY="Select PIM category (Esc to exit)"
+FZF_HEADER_ROLES="Space/Tab=select  Enter=confirm  Ctrl-A=all  Esc=back"
+FZF_HEADER_DURATION="Select activation duration (Esc=back)"
 
 # Session state
 USER_ID=""
@@ -230,7 +230,7 @@ pick_category() {
         "Entra ID Roles" \
         "PIM Groups" \
         "Azure Resources" \
-        | fzf $FZF_SINGLE $FZF_HEADER_CATEGORY) || return 1
+        | fzf $FZF_SINGLE --header="$FZF_HEADER_CATEGORY") || return 1
     echo "$selection"
 }
 
