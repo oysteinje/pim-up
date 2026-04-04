@@ -59,6 +59,10 @@ Authentication piggybacks on your Azure CLI session (`az account get-access-toke
 
 - Activate multiple roles in parallell for effiency
 
+# Known bugs 
+
+- Azure resources are not shown in active assignments 
+
 ## License
 
 MIT

@@ -1,5 +1,5 @@
 # generated: 2026-04-03
-# last_updated: 2026-04-04  # story 2.2 review
+# last_updated: 2026-04-04  # story 2.3 created
 # project: pim-me-up
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-04-03
-last_updated: 2026-04-04
+last_updated: 2026-04-04  # story 2.3 created
 project: pim-me-up
 project_key: NOKEY
 tracking_system: file-system
@@ -53,7 +53,7 @@ development_status:
   epic-2: in-progress
   2-1-fetch-and-display-entra-id-roles-and-pim-groups: done
   2-2-fetch-and-display-azure-resource-roles-with-subscription-picker: review
-  2-3-multi-select-fuzzy-search-and-session-caching: backlog
+  2-3-multi-select-fuzzy-search-and-session-caching: ready-for-dev
   epic-2-retrospective: optional
 
   # Epic 3: Activation & Results

@@ -195,11 +195,35 @@ fetch_active_pim() {
 }
 
 fetch_active_arm() {
-    local result
-    result=$(az rest --method GET \
-        --url "$ARM_API/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?\$filter=asTarget()&api-version=2020-10-01" \
-        2>/dev/null) || { echo '{"value":[]}'; return 0; }
-    echo "$result"
+    local subs
+    subs=$(az account list --query '[].id' -o tsv 2>/dev/null) || { echo '{"value":[]}'; return 0; }
+    [[ -z "$subs" ]] && { echo '{"value":[]}'; return 0; }
+
+    local arm_tmpdir
+    arm_tmpdir=$(mktemp -d)
+
+    local pids=()
+    while IFS= read -r sub_id; do
+        [[ -z "$sub_id" ]] && continue
+        (
+            az rest --method GET \
+                --url "$ARM_API/subscriptions/$sub_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?\$filter=asTarget()&api-version=2020-10-01" \
+                > "$arm_tmpdir/$sub_id" 2>/dev/null || rm -f "$arm_tmpdir/$sub_id"
+        ) &
+        pids+=($!)
+    done <<< "$subs"
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    if compgen -G "$arm_tmpdir/*" >/dev/null 2>&1; then
+        jq -s '{"value": [.[].value[]]}' "$arm_tmpdir"/* 2>/dev/null || echo '{"value":[]}'
+    else
+        echo '{"value":[]}'
+    fi
+
+    rm -rf "$arm_tmpdir"
 }
 
 pim_list_eligible() {
@@ -298,19 +322,10 @@ format_pim_groups() {
 
 format_arm_roles() {
     local json="$1"
-    while IFS=$'\t' read -r assignment_type role scope_type scope_name scope_path; do
-        [[ "$assignment_type" == "Activated" ]] || continue
-        local scope_label
-        scope_label=$(format_arm_scope_label "$scope_path" "$scope_type" "$scope_name")
-        printf "%s | %s\n" "$scope_label" "$role"
-    done < <(jq -r '.value[] |
-        [
-          (.properties.assignmentType // ""),
-          (.properties.expandedProperties.roleDefinition.displayName // "unknown"),
-          (.properties.expandedProperties.scope.type // ""),
-          (.properties.expandedProperties.scope.displayName // ""),
-          (.properties.expandedProperties.scope.id // .properties.scope // "")
-        ] | @tsv' <<< "$json" 2>/dev/null)
+    jq -r '.value[]
+        | select((.properties.endDateTime // "") != "")
+        | (.properties.expandedProperties.roleDefinition.displayName // "unknown") + " (" +
+        (.properties.expandedProperties.scope.displayName // "unknown") + ")"' <<< "$json" 2>/dev/null
 }
 
 count_nonempty_lines() {
