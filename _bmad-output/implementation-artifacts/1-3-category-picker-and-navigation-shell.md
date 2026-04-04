@@ -1,6 +1,6 @@
 # Story 1.3: Category Picker & Navigation Shell
 
-Status: review
+Status: done
 
 ## Story
 
@@ -208,7 +208,17 @@ Manual testing (no test framework — consistent with Stories 1.1 and 1.2):
 
 ## Review Findings
 
-(none yet)
+- [x] [Review][Decision] FZF header constants omit `--header=` prefix — resolved: aligned with spec, `--header=` now embedded in variable values; call site updated to bare expansion
+- [x] [Review][Patch] `fzf $FZF_SINGLE` unquoted word splitting in `pick_category` — fixed: converted FZF_COMMON/FZF_SINGLE/FZF_MULTI to arrays; call site uses `"${FZF_SINGLE[@]}"` [pim-me-up:233]
+- [x] [Review][Defer] USER_ID embedded raw in OData filter URL [pim-me-up:118] — deferred, pre-existing (Story 1.2 scope)
+- [x] [Review][Defer] Silent API error suppression masks auth/network failures [pim-me-up:fetch_active_pim] — deferred, pre-existing (Story 1.2 scope)
+- [x] [Review][Defer] 1-second polling timeout may be too short on WAN/VPN [pim-me-up:168] — deferred, pre-existing (Story 1.2 scope)
+- [x] [Review][Defer] `date +%s%3N` GNU extension not portable to macOS BSD date [pim-me-up:168] — deferred, pre-existing (Story 1.2 scope)
+- [x] [Review][Defer] `grep -c .` returns 1 for empty string (phantom count) [pim-me-up:205] — deferred, pre-existing (Story 1.2 scope)
+- [x] [Review][Defer] `trap "rm -rf '$tmpdir'" RETURN` does not cover ERR exit path [pim-me-up:158] — deferred, pre-existing (Story 1.2 scope)
+- [x] [Review][Defer] `mktemp -d` failure not handled [pim-me-up:155] — deferred, pre-existing (Story 1.2 scope)
+- [x] [Review][Defer] `curl` declared as dependency but never used [pim-me-up:check_deps] — deferred, pre-existing (Story 1.1 scope)
+- [x] [Review][Defer] `printf "${RED}..."` uses color var as format string [pim-me-up:die] — deferred, pre-existing (Story 1.1 scope)
 
 ## Dev Agent Record
 
