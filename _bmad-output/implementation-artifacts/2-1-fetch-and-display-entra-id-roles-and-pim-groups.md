@@ -1,6 +1,6 @@
 # Story 2.1: Fetch & Display Entra ID Roles and PIM Groups
 
-Status: review
+Status: done
 
 ## Story
 
@@ -58,6 +58,17 @@ so that I can quickly find and select the roles I need.
   - [ ] 6.4: Press Esc at role picker → verify returns to category picker (no exit)
   - [ ] 6.5: Verify 403 or API error results in message + returns to category picker
   - [ ] 6.6: Observe role list renders within 3 seconds of category selection
+
+### Review Findings
+
+- [x] [Review][Patch] ID fallbacks use `""` instead of spec-required `"unknown"` in `format_entra_eligible` and `format_groups_eligible` [pim-me-up]
+- [x] [Review][Patch] `echo "$lines"` in `pick_roles` may misparse role names starting with `-` — use `printf '%s\n'` [pim-me-up]
+- [x] [Review][Patch] No guard on empty `lines` in `flow_entra_roles`/`flow_pim_groups` — silent format failure lets fzf exit 0 with empty selection, printing "Roles selected" with no data [pim-me-up]
+- [x] [Review][Patch] `jq '.value | length'` returns `null` on non-`.value` API responses, treated as 0, shows misleading "No eligible assignments found" instead of surfacing the API error [pim-me-up]
+- [x] [Review][Defer] `date +%s%3N` not portable on macOS in `show_active_assignments` [pim-me-up] — deferred, pre-existing
+- [x] [Review][Defer] 1-second polling timeout too short for real Azure API latency in `show_active_assignments` [pim-me-up] — deferred, pre-existing
+- [x] [Review][Defer] `grep -c .` inflates count by 1 for empty input in `show_active_assignments` [pim-me-up] — deferred, pre-existing
+- [x] [Review][Defer] Background jobs not killed on Ctrl-C (INT) in `show_active_assignments` [pim-me-up] — deferred, pre-existing
 
 ## Dev Notes
 

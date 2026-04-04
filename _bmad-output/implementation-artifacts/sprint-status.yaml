@@ -1,5 +1,5 @@
 # generated: 2026-04-03
-# last_updated: 2026-04-04  # story 2.1 ready-for-dev
+# last_updated: 2026-04-04  # story 2.1 done
 # project: pim-me-up
 # project_key: NOKEY
 # tracking_system: file-system
@@ -51,7 +51,7 @@ development_status:
 
   # Epic 2: Role Discovery & Selection
   epic-2: in-progress
-  2-1-fetch-and-display-entra-id-roles-and-pim-groups: review
+  2-1-fetch-and-display-entra-id-roles-and-pim-groups: done
   2-2-fetch-and-display-azure-resource-roles-with-subscription-picker: backlog
   2-3-multi-select-fuzzy-search-and-session-caching: backlog
   epic-2-retrospective: optional

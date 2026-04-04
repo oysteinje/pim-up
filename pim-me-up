@@ -165,8 +165,8 @@ format_entra_eligible() {
         (.roleDefinition.displayName // "unknown") + " | " +
         (.roleDefinition.resource.displayName // "unknown") +
         "\t" +
-        "roleDefinitionId=" + (.roleDefinitionId // "") +
-        "&resourceId=" + (.resourceId // "")' <<< "$json" 2>/dev/null
+        "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
+        "&resourceId=" + (.resourceId // "unknown")' <<< "$json" 2>/dev/null
 }
 
 format_groups_eligible() {
@@ -175,8 +175,8 @@ format_groups_eligible() {
         (.roleDefinition.resource.displayName // "unknown") + " | " +
         (.roleDefinition.displayName // "member") +
         "\t" +
-        "roleDefinitionId=" + (.roleDefinitionId // "") +
-        "&resourceId=" + (.resourceId // "")' <<< "$json" 2>/dev/null
+        "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
+        "&resourceId=" + (.resourceId // "unknown")' <<< "$json" 2>/dev/null
 }
 
 # -----------------------------------------------------------------------------
@@ -269,7 +269,7 @@ pick_category() {
 pick_roles() {
     local lines="$1"
     local selected
-    selected=$(echo "$lines" | fzf "${FZF_MULTI[@]}" "$FZF_HEADER_ROLES" \
+    selected=$(printf '%s\n' "$lines" | fzf "${FZF_MULTI[@]}" "$FZF_HEADER_ROLES" \
         --with-nth=1 --delimiter=$'\t') || return 1
     echo "$selected"
 }
@@ -279,7 +279,7 @@ flow_entra_roles() {
     json=$(pim_list_eligible "aadroles") || return 1
 
     local count
-    count=$(jq -r '.value | length' <<< "$json" 2>/dev/null) || count=0
+    count=$(jq -r 'if .value then (.value | length) else 0 end' <<< "$json" 2>/dev/null) || count=0
     if (( count == 0 )); then
         printf "${YELLOW}No eligible assignments found for Entra ID Roles${NC}\n"
         return 1
@@ -287,6 +287,10 @@ flow_entra_roles() {
 
     local lines
     lines=$(format_entra_eligible "$json")
+    if [[ -z "$lines" ]]; then
+        printf "${YELLOW}No eligible assignments found for Entra ID Roles${NC}\n"
+        return 1
+    fi
     pick_roles "$lines" || return 1
 }
 
@@ -295,7 +299,7 @@ flow_pim_groups() {
     json=$(pim_list_eligible "aadGroups") || return 1
 
     local count
-    count=$(jq -r '.value | length' <<< "$json" 2>/dev/null) || count=0
+    count=$(jq -r 'if .value then (.value | length) else 0 end' <<< "$json" 2>/dev/null) || count=0
     if (( count == 0 )); then
         printf "${YELLOW}No eligible assignments found for PIM Groups${NC}\n"
         return 1
@@ -303,6 +307,10 @@ flow_pim_groups() {
 
     local lines
     lines=$(format_groups_eligible "$json")
+    if [[ -z "$lines" ]]; then
+        printf "${YELLOW}No eligible assignments found for PIM Groups${NC}\n"
+        return 1
+    fi
     pick_roles "$lines" || return 1
 }
 

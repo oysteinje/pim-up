@@ -21,3 +21,10 @@
 - `mktemp -d` failure not handled — silent empty path on full /tmp; Story 1.2 scope
 - `curl` listed as required dependency but never called — unnecessary failure point on minimal environments; Story 1.1 scope
 - `printf "${RED}..."` uses color escape as format string — safe now but fragile if escapes ever contain `%`; Story 1.1 scope
+
+## Deferred from: code review of 2-1-fetch-and-display-entra-id-roles-and-pim-groups (2026-04-04)
+
+- `date +%s%3N` not portable on macOS in `show_active_assignments` — pre-existing, also deferred from 1-3 review
+- 1-second polling timeout too short for real Azure API latency in `show_active_assignments` — pre-existing, also deferred from 1-2 review
+- `grep -c .` inflates count by 1 for empty input in `show_active_assignments` — pre-existing, also deferred from 1-3 review
+- Background jobs not killed on Ctrl-C (INT) in `show_active_assignments` — SIGINT fires `exit 0` via main's trap before RETURN trap cleans up tmpdir; pre-existing
