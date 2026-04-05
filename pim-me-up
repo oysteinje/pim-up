@@ -23,9 +23,9 @@ DURATION_OPTIONS=("1h" "2h" "4h" "8h")
 
 # fzf configuration — dynamic height (~) requires fzf 0.30+
 if fzf --height=~1 </dev/null >/dev/null 2>&1; then
-    FZF_COMMON=(--height=~50% --border --margin=1,2)
+    FZF_COMMON=(--height=~50% --border --margin=1,2 --ansi)
 else
-    FZF_COMMON=(--height=50% --border --margin=1,2)
+    FZF_COMMON=(--height=50% --border --margin=1,2 --ansi)
 fi
 FZF_SINGLE=("${FZF_COMMON[@]}" --no-multi)
 FZF_MULTI=("${FZF_COMMON[@]}" --multi --bind=tab:toggle,ctrl-a:toggle-all)
@@ -195,13 +195,13 @@ format_arm_scope_label() {
 
     case "$normalized_type" in
         managementgroup)
-            printf "Management Group: %s" "$fallback_name"
+            printf "MG: %s" "$fallback_name"
             ;;
         subscription)
-            printf "Subscription: %s" "$fallback_name"
+            printf "Sub: %s" "$fallback_name"
             ;;
         resourcegroup)
-            printf "Resource Group: %s" "${rg_name:-$fallback_name}"
+            printf "RG: %s" "${rg_name:-$fallback_name}"
             ;;
         *)
             if [[ -n "$rg_name" ]]; then
@@ -387,8 +387,8 @@ arm_activate() {
 format_entra_eligible() {
     local json="$1"
     jq -r '.value[] |
-        (.roleDefinition.displayName // "unknown") + " | " +
-        (.roleDefinition.resource.displayName // "unknown") +
+        (.roleDefinition.displayName // "unknown") + "\u001b[2m | " +
+        (.roleDefinition.resource.displayName // "unknown") + "\u001b[0m" +
         "\t" +
         "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
         "&resourceId=" + (.resourceId // "unknown")' <<< "$json" 2>/dev/null
@@ -397,8 +397,8 @@ format_entra_eligible() {
 format_groups_eligible() {
     local json="$1"
     jq -r '.value[] |
-        (.roleDefinition.resource.displayName // "unknown") + " | " +
-        (.roleDefinition.displayName // "member") +
+        (.roleDefinition.resource.displayName // "unknown") + "\u001b[2m | " +
+        (.roleDefinition.displayName // "member") + "\u001b[0m" +
         "\t" +
         "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
         "&resourceId=" + (.resourceId // "unknown")' <<< "$json" 2>/dev/null
@@ -422,10 +422,10 @@ format_arm_eligible() {
         local activation_scope="$scope"
         if [[ "$mode" == "subscription" && "$normalized_scope_type" == "managementgroup" && -n "$selected_scope" ]]; then
             activation_scope="$selected_scope"
-            scope_label="Subscription: ${selected_scope_name:-unknown} (Inherited from ${scope_label})"
+            scope_label="${selected_scope_name:-unknown} [↑ ${scope_name:-MG}]"
         fi
 
-        printf "%s | %s\troleDefinitionId=%s&scope=%s\n" \
+        printf "%s\033[2m | %s\033[0m\troleDefinitionId=%s&scope=%s\n" \
             "$role" "$scope_label" "$role_definition_id" "$activation_scope"
     done < <(jq -r '.value[] |
         [
@@ -440,32 +440,38 @@ format_arm_eligible() {
 
 format_active_entra_roles() {
     local json="$1"
-    jq -r '.value[].roleDefinition.displayName // empty' <<< "$json" 2>/dev/null
+    jq -r 'def fmt_expiry: split("T") | .[0] + " " + (.[1] | split(":")[0:2] | join(":"));
+        .value[] |
+        (.roleDefinition.displayName // empty) +
+        (if (.endDateTime // "") != "" then " [expires " + (.endDateTime | fmt_expiry) + "]" else "" end)' <<< "$json" 2>/dev/null
 }
 
 format_active_pim_groups() {
     local json="$1"
-    jq -r '.value[] |
+    jq -r 'def fmt_expiry: split("T") | .[0] + " " + (.[1] | split(":")[0:2] | join(":"));
+        .value[] |
         ((.roleDefinition.resource.displayName // .resource.displayName // .resourceId // "unknown") +
-        (if (.roleDefinition.displayName // "") != "" then " (" + .roleDefinition.displayName + ")" else "" end))' <<< "$json" 2>/dev/null
+        (if (.roleDefinition.displayName // "") != "" then " (" + .roleDefinition.displayName + ")" else "" end)) +
+        (if (.endDateTime // "") != "" then " [expires " + (.endDateTime | fmt_expiry) + "]" else "" end)' <<< "$json" 2>/dev/null
 }
 
 format_active_arm_roles() {
     local json="$1"
-    jq -r '.value[]
+    jq -r 'def fmt_expiry: split("T") | .[0] + " " + (.[1] | split(":")[0:2] | join(":"));
+        .value[]
         | select((.properties.endDateTime // "") != "")
         | (.properties.expandedProperties.roleDefinition.displayName // "unknown") + " (" +
           (
             if (.properties.expandedProperties.scope.type // "" | ascii_downcase) == "managementgroup" then
-                "Management Group: " + (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
+                "MG: " + (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
             elif (.properties.expandedProperties.scope.type // "" | ascii_downcase) == "subscription" then
-                "Subscription: " + (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
+                "Sub: " + (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
             elif (.properties.expandedProperties.scope.type // "" | ascii_downcase) == "resourcegroup" then
-                "Resource Group: " + (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
+                "RG: " + (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
             else
                 (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
             end
-          ) + ")"' <<< "$json" 2>/dev/null
+          ) + ") [expires " + (.properties.endDateTime | fmt_expiry) + "]"' <<< "$json" 2>/dev/null
 }
 
 count_nonempty_lines() {
@@ -500,6 +506,7 @@ show_active_assignments() {
 
     (
         sleep 30
+        touch "$tmpdir/timed_out"
         kill "$pid_entra" "$pid_groups" "$pid_arm" 2>/dev/null || true
     ) &
     local pid_killer=$!
@@ -507,6 +514,9 @@ show_active_assignments() {
     wait "$pid_entra" "$pid_groups" "$pid_arm" 2>/dev/null || true
     kill "$pid_killer" 2>/dev/null || true
     wait "$pid_killer" 2>/dev/null || true
+
+    local timed_out=false
+    [[ -f "$tmpdir/timed_out" ]] && timed_out=true
 
     local entra_json groups_json arm_json
     entra_json=$(<"$tmpdir/entra")
@@ -525,6 +535,8 @@ show_active_assignments() {
     groups_count=$(count_nonempty_lines "$groups_names")
     arm_count=$(count_nonempty_lines "$arm_names")
     total=$((entra_count + groups_count + arm_count))
+
+    $timed_out && printf "${YELLOW}Warning: fetch timed out after 30s — results may be incomplete${NC}\n"
 
     if (( total == 0 )); then
         echo "No active assignments"
@@ -688,16 +700,24 @@ pick_management_groups() {
 
 pick_duration() {
     local selected
-    selected=$(printf '%s\n' "1h" "2h" "4h" "8h" \
+    selected=$(printf '%s\n' "${DURATION_OPTIONS[@]}" \
         | fzf "${FZF_SINGLE[@]}" "$FZF_HEADER_DURATION") || return 1
     echo "$selected"
 }
 
 get_justification() {
+    local role_count="${1:-}"
+    local count_hint=""
+    [[ -n "$role_count" ]] && count_hint=" ($role_count role(s) selected)"
+    local error_hint=""
+
     while true; do
+        local header="Enter justification (required${count_hint}, Esc=back)"
+        [[ -n "$error_hint" ]] && header="${error_hint}"$'\n'"${header}"
+
         local output
         output=$(echo "" | fzf "${FZF_SINGLE[@]}" \
-            --header="Enter justification (required, Esc=back to duration picker)" \
+            --header="$header" \
             --print-query \
             --disabled \
             --prompt="Justification: ") || return 1
@@ -710,7 +730,7 @@ get_justification() {
             return 0
         fi
 
-        printf "${YELLOW}Justification is required.${NC}\n"
+        error_hint="Justification cannot be empty."
     done
 }
 
@@ -887,8 +907,10 @@ activate_batch() {
     local duration="$3"
     local justification="$4"
 
-    local had_failure=false
-    printf "\nActivating roles...\n"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pids=() displays=()
+    local idx=0
 
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -897,36 +919,65 @@ activate_batch() {
         display=$(cut -d$'\t' -f1 <<< "$line")
         meta=$(cut -d$'\t' -f2 <<< "$line")
 
-        # Parse roleDefinitionId (always first key before &)
         local role_def_id="${meta%%&*}"
         role_def_id="${role_def_id#roleDefinitionId=}"
 
-        printf "  %s... " "$display"
+        displays+=("$display")
+        local result_file="$tmpdir/$idx"
+        (
+            local err="" ok=true
+            case "$category" in
+                "Entra ID Roles")
+                    local resource_id="${meta#*resourceId=}"
+                    err=$(pim_activate "aadroles" "$role_def_id" "$resource_id" "$duration" "$justification" 2>&1) || ok=false
+                    ;;
+                "PIM Groups")
+                    local resource_id="${meta#*resourceId=}"
+                    err=$(pim_activate "aadGroups" "$role_def_id" "$resource_id" "$duration" "$justification" 2>&1) || ok=false
+                    ;;
+                "Azure Resources")
+                    local scope="${meta#*scope=}"
+                    err=$(arm_activate "$scope" "$role_def_id" "$duration" "$justification" 2>&1) || ok=false
+                    ;;
+            esac
+            if $ok; then
+                printf "ok\n" > "$result_file"
+            else
+                printf "err\n%s" "$err" > "$result_file"
+            fi
+        ) &
+        pids+=($!)
+        idx=$(( idx + 1 ))
+    done <<< "$selections"
 
-        local err="" activation_ok=true
-        case "$category" in
-            "Entra ID Roles")
-                local resource_id="${meta#*resourceId=}"
-                err=$(pim_activate "aadroles" "$role_def_id" "$resource_id" "$duration" "$justification" 2>&1) || activation_ok=false
-                ;;
-            "PIM Groups")
-                local resource_id="${meta#*resourceId=}"
-                err=$(pim_activate "aadGroups" "$role_def_id" "$resource_id" "$duration" "$justification" 2>&1) || activation_ok=false
-                ;;
-            "Azure Resources")
-                local scope="${meta#*scope=}"
-                err=$(arm_activate "$scope" "$role_def_id" "$duration" "$justification" 2>&1) || activation_ok=false
-                ;;
-        esac
+    printf "\nActivating %d role(s) in parallel...\n" "${#pids[@]}"
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
 
-        if $activation_ok; then
-            printf "${GREEN}✓${NC}\n"
+    local had_failure=false
+    for (( i=0; i<${#displays[@]}; i++ )); do
+        printf "  %s... " "${displays[$i]}"
+        local result_file="$tmpdir/$i"
+        if [[ -f "$result_file" ]]; then
+            local status
+            status=$(head -1 "$result_file")
+            if [[ "$status" == "ok" ]]; then
+                printf "${GREEN}✓${NC}\n"
+            else
+                printf "${RED}✗${NC}\n"
+                local err
+                err=$(tail -n +2 "$result_file")
+                [[ -n "$err" ]] && printf "    ${RED}%s${NC}\n" "$err"
+                had_failure=true
+            fi
         else
-            printf "${RED}✗${NC}\n"
-            printf "    ${RED}%s${NC}\n" "$err"
+            printf "${RED}✗ (no result)${NC}\n"
             had_failure=true
         fi
-    done <<< "$selections"
+    done
+
+    rm -rf "$tmpdir"
 
     if $had_failure; then
         printf "\n${YELLOW}Some activations failed. See errors above.${NC}\n"
@@ -980,8 +1031,9 @@ main() {
                     step="justification"
                     ;;
                 "justification")
-                    local new_justification
-                    new_justification=$(get_justification) || { step="duration"; continue; }
+                    local new_justification role_count
+                    role_count=$(count_nonempty_lines "$selected_roles")
+                    new_justification=$(get_justification "$role_count") || { step="duration"; continue; }
                     justification="$new_justification"
                     step="activate"
                     ;;
