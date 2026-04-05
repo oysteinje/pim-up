@@ -48,6 +48,9 @@ CACHE_ARM_KIND=""  # cached Azure Resources branch for back-navigation
 CACHE_ARM_SUB=""   # cached Azure Resource role lines for subscription flow
 CACHE_ARM_MG=""    # cached Azure Resource role lines for management group flow
 CACHE_SUB_LOOKUP="" # cached subscription lookup JSON
+CACHE_ALL_FLAT=""  # cached flat list of all eligible roles (all categories combined)
+PREFETCH_PID=""    # PID of background prefetch job
+PREFETCH_FILE=""   # tmpfile written by background prefetch job
 
 # -----------------------------------------------------------------------------
 # Utility Functions
@@ -404,6 +407,28 @@ format_groups_eligible() {
         "&resourceId=" + (.resourceId // "unknown")' <<< "$json" 2>/dev/null
 }
 
+format_entra_eligible_prefixed() {
+    local json="$1"
+    jq -r '.value[] |
+        "entra: " + (.roleDefinition.displayName // "unknown") + "\u001b[2m | " +
+        (.roleDefinition.resource.displayName // "unknown") + "\u001b[0m" +
+        "\t" +
+        "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
+        "&resourceId=" + (.resourceId // "unknown") +
+        "&pimcat=aadroles"' <<< "$json" 2>/dev/null
+}
+
+format_groups_eligible_prefixed() {
+    local json="$1"
+    jq -r '.value[] |
+        "grp: " + (.roleDefinition.resource.displayName // "unknown") + "\u001b[2m | " +
+        (.roleDefinition.displayName // "member") + "\u001b[0m" +
+        "\t" +
+        "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
+        "&resourceId=" + (.resourceId // "unknown") +
+        "&pimcat=aadGroups"' <<< "$json" 2>/dev/null
+}
+
 format_arm_eligible() {
     local json="$1"
     local mode="${2:-direct}"
@@ -427,6 +452,48 @@ format_arm_eligible() {
 
         printf "%s\033[2m | %s\033[0m\troleDefinitionId=%s&scope=%s\n" \
             "$role" "$scope_label" "$role_definition_id" "$activation_scope"
+    done < <(jq -r '.value[] |
+        [
+          (.properties.expandedProperties.roleDefinition.displayName // "unknown"),
+          (.properties.expandedProperties.scope.type // ""),
+          (.properties.expandedProperties.scope.displayName // ""),
+          (.properties.expandedProperties.scope.id // .properties.scope // ""),
+          (.properties.roleDefinitionId // ""),
+          (.properties.scope // "")
+        ] | @tsv' <<< "$json" 2>/dev/null)
+}
+
+format_arm_eligible_prefixed() {
+    local json="$1"
+    local mode="${2:-direct}"
+    local selected_scope="${3:-}"
+    local selected_scope_name="${4:-}"
+
+    while IFS=$'\t' read -r role scope_type scope_name scope_path role_definition_id scope; do
+        local effective_scope_path="${scope:-$scope_path}"
+
+        local normalized_scope_type
+        normalized_scope_type=$(normalize_arm_scope_type "$effective_scope_path" "$scope_type")
+
+        local scope_label
+        scope_label=$(format_arm_scope_label "$effective_scope_path" "$scope_type" "$scope_name")
+
+        local activation_scope="$scope"
+        if [[ "$mode" == "subscription" && "$normalized_scope_type" == "managementgroup" && -n "$selected_scope" ]]; then
+            activation_scope="$selected_scope"
+            scope_label="${selected_scope_name:-unknown} [↑ ${scope_name:-MG}]"
+        fi
+
+        local prefix
+        case "$normalized_scope_type" in
+            managementgroup) prefix="mgmt:" ;;
+            subscription)    prefix="sub:" ;;
+            resourcegroup)   prefix="rg:" ;;
+            *)               prefix="res:" ;;
+        esac
+
+        printf "%s %s\033[2m | %s\033[0m\troleDefinitionId=%s&scope=%s\n" \
+            "$prefix" "$role" "$scope_label" "$role_definition_id" "$activation_scope"
     done < <(jq -r '.value[] |
         [
           (.properties.expandedProperties.roleDefinition.displayName // "unknown"),
@@ -590,6 +657,7 @@ pick_category() {
         "PIM Groups" \
         "Azure Resources" \
         "Active Assignments" \
+        "All Roles" \
         | fzf "${FZF_SINGLE[@]}" "$FZF_HEADER_CATEGORY") || return 1
     echo "$selection"
 }
@@ -743,6 +811,126 @@ get_justification() {
 
         error_hint="Justification cannot be empty."
     done
+}
+
+fetch_all_eligible_parallel() {
+    load_subscription_lookup 2>/dev/null || true
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pids=()
+
+    # Phase 1: Entra, Groups, and enumeration lists — all in parallel
+    ( pim_list_eligible "aadroles" 2>/dev/null || echo '{"value":[]}' ) > "$tmpdir/entra.json" &
+    pids+=($!)
+
+    ( pim_list_eligible "aadGroups" 2>/dev/null || echo '{"value":[]}' ) > "$tmpdir/groups.json" &
+    pids+=($!)
+
+    ( az account list --query '[].id' -o tsv 2>/dev/null || true ) > "$tmpdir/sub_ids.txt" &
+    pids+=($!)
+
+    (
+        local mg_json
+        mg_json=$(arm_list_management_groups 2>/dev/null) || mg_json='{"value":[]}'
+        jq -r '(.value // [])[] | .name' <<< "$mg_json" 2>/dev/null || true
+    ) > "$tmpdir/mg_ids.txt" &
+    pids+=($!)
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    # Phase 2: one background process per subscription and per MG
+    pids=()
+
+    while IFS= read -r sub_id; do
+        [[ -z "$sub_id" ]] && continue
+        local scope_key
+        scope_key=$(printf '%s' "$sub_id" | tr '/' '_')
+        (
+            local json count
+            json=$(arm_list_eligible "$sub_id" 2>/dev/null) || exit 0
+            count=$(jq '.value | length' <<< "$json" 2>/dev/null) || count=0
+            (( count == 0 )) && exit 0
+            format_arm_eligible_prefixed "$json" "subscription" "/subscriptions/$sub_id" "$(lookup_subscription_name "$sub_id")"
+        ) > "$tmpdir/arm_sub_${scope_key}.txt" &
+        pids+=($!)
+    done < "$tmpdir/sub_ids.txt"
+
+    while IFS= read -r mg_id; do
+        [[ -z "$mg_id" ]] && continue
+        local scope_key
+        scope_key=$(printf '%s' "$mg_id" | tr '/' '_')
+        (
+            local json count
+            json=$(arm_list_eligible_management_group "$mg_id" 2>/dev/null) || exit 0
+            count=$(jq '.value | length' <<< "$json" 2>/dev/null) || count=0
+            (( count == 0 )) && exit 0
+            format_arm_eligible_prefixed "$json"
+        ) > "$tmpdir/arm_mg_${scope_key}.txt" &
+        pids+=($!)
+    done < "$tmpdir/mg_ids.txt"
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    # Merge all results
+    local all_lines="" entra_lines groups_lines
+
+    [[ -f "$tmpdir/entra.json" ]] && entra_lines=$(format_entra_eligible_prefixed "$(<"$tmpdir/entra.json")") || entra_lines=""
+    [[ -f "$tmpdir/groups.json" ]] && groups_lines=$(format_groups_eligible_prefixed "$(<"$tmpdir/groups.json")") || groups_lines=""
+
+    [[ -n "$entra_lines" ]] && all_lines+="${entra_lines}"$'\n'
+    [[ -n "$groups_lines" ]] && all_lines+="${groups_lines}"$'\n'
+
+    for f in "$tmpdir"/arm_sub_*.txt "$tmpdir"/arm_mg_*.txt; do
+        [[ -f "$f" ]] || continue
+        local content
+        content=$(<"$f")
+        [[ -n "$content" ]] && all_lines+="${content}"$'\n'
+    done
+
+    rm -rf "$tmpdir"
+
+    printf '%s' "$all_lines"
+}
+
+flow_all_roles() {
+    local prev_selections="${1:-}"
+
+    if [[ -n "$CACHE_ALL_FLAT" ]]; then
+        pick_roles "$CACHE_ALL_FLAT" "$prev_selections" || return 1
+        return 0
+    fi
+
+    # Use background prefetch if one was started; otherwise fetch now
+    if [[ -z "$PREFETCH_PID" ]]; then
+        PREFETCH_FILE=$(mktemp)
+        fetch_all_eligible_parallel > "$PREFETCH_FILE" &
+        PREFETCH_PID=$!
+    fi
+
+    if kill -0 "$PREFETCH_PID" 2>/dev/null; then
+        show_spinner "$PREFETCH_PID" "Fetching all eligible roles"
+    else
+        wait "$PREFETCH_PID" 2>/dev/null || true
+    fi
+
+    local all_lines
+    all_lines=$(<"$PREFETCH_FILE")
+    rm -f "$PREFETCH_FILE"
+    PREFETCH_PID=""
+    PREFETCH_FILE=""
+
+    if [[ -z "${all_lines//[[:space:]]/}" ]]; then
+        printf "${YELLOW}No eligible assignments found${NC}\n"
+        return 1
+    fi
+
+    CACHE_ALL_FLAT="$all_lines"
+    pick_roles "$all_lines" "$prev_selections" || return 1
 }
 
 flow_entra_roles() {
@@ -950,6 +1138,17 @@ activate_batch() {
                     local scope="${meta#*scope=}"
                     err=$(arm_activate "$scope" "$role_def_id" "$duration" "$justification" 2>&1) || ok=false
                     ;;
+                "All Roles")
+                    if [[ "$meta" == *"&scope="* ]]; then
+                        local scope="${meta#*&scope=}"
+                        err=$(arm_activate "$scope" "$role_def_id" "$duration" "$justification" 2>&1) || ok=false
+                    else
+                        local resource_id pimcat
+                        resource_id="${meta#*resourceId=}"; resource_id="${resource_id%%&*}"
+                        pimcat="${meta#*pimcat=}"; pimcat="${pimcat%%&*}"
+                        err=$(pim_activate "$pimcat" "$role_def_id" "$resource_id" "$duration" "$justification" 2>&1) || ok=false
+                    fi
+                    ;;
             esac
             if $ok; then
                 printf "ok\n" > "$result_file"
@@ -1002,7 +1201,7 @@ activate_batch() {
 # -----------------------------------------------------------------------------
 
 main() {
-    trap 'exit 0' INT TERM   # Ctrl-C anywhere → clean exit
+    trap 'kill "$PREFETCH_PID" 2>/dev/null; rm -f "$PREFETCH_FILE"; exit 0' INT TERM
 
     check_deps
     get_user_id
@@ -1025,6 +1224,8 @@ main() {
                 "roles")
                     local new_roles
                     case "$category" in
+                        "All Roles")
+                            new_roles=$(flow_all_roles "$selected_roles") || break ;;
                         "Entra ID Roles")
                             new_roles=$(flow_entra_roles "$selected_roles") || break ;;
                         "PIM Groups")
