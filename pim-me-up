@@ -41,6 +41,11 @@ FZF_HEADER_MGS="--header=Select management groups (Tab=toggle  Ctrl-A=all  Esc=b
 # Session state
 USER_ID=""
 
+# Bearer tokens — fetched once in parallel at startup
+TOKEN_PIM=""    # for api.azrbac.mspim.azure.com
+TOKEN_ARM=""    # for management.azure.com
+TOKEN_GRAPH=""  # for graph.microsoft.com
+
 # Session caching — populated by Epic 2 stories
 CACHE_ENTRA=""     # cached eligible Entra ID Roles JSON
 CACHE_GROUPS=""    # cached eligible PIM Groups JSON
@@ -78,27 +83,68 @@ check_deps() {
     fi
 }
 
+load_tokens() {
+    local tmp_pim tmp_arm tmp_graph
+    tmp_pim=$(mktemp); tmp_arm=$(mktemp); tmp_graph=$(mktemp)
+
+    az account get-access-token --resource "https://api.azrbac.mspim.azure.com" > "$tmp_pim" 2>/dev/null &
+    local pid_pim=$!
+    az account get-access-token --resource "https://management.azure.com"        > "$tmp_arm" 2>/dev/null &
+    local pid_arm=$!
+    az account get-access-token --resource "https://graph.microsoft.com"         > "$tmp_graph" 2>/dev/null &
+    local pid_graph=$!
+
+    wait "$pid_pim" "$pid_arm" "$pid_graph" 2>/dev/null || true
+
+    TOKEN_PIM=$(jq -r '.accessToken // empty'   "$tmp_pim"   2>/dev/null) || TOKEN_PIM=""
+    TOKEN_ARM=$(jq -r '.accessToken // empty'   "$tmp_arm"   2>/dev/null) || TOKEN_ARM=""
+    TOKEN_GRAPH=$(jq -r '.accessToken // empty' "$tmp_graph" 2>/dev/null) || TOKEN_GRAPH=""
+    rm -f "$tmp_pim" "$tmp_arm" "$tmp_graph"
+
+    if [[ -z "$TOKEN_PIM" || -z "$TOKEN_ARM" ]]; then
+        die "Failed to acquire access tokens — run \`az login\` first"
+    fi
+}
+
+# curl wrappers — curl_get TOKEN URL, curl_post TOKEN URL BODY, curl_put TOKEN URL BODY
+curl_get() {
+    curl -sf -H "Authorization: Bearer $1" -H "Content-Type: application/json" "${@:2}"
+}
+curl_post() {
+    curl -sf -X POST -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
+        -d "$3" "$2"
+}
+curl_put() {
+    curl -sf -X PUT -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
+        -d "$3" "$2"
+}
+
 get_user_id() {
-    local user_json
-    if ! user_json=$(az ad signed-in-user show 2>/dev/null); then
-        die "Run \`az login\` first"
+    # Fetch /me and /organization in parallel
+    local tmp_me tmp_org
+    tmp_me=$(mktemp); tmp_org=$(mktemp)
+    curl_get "$TOKEN_GRAPH" "https://graph.microsoft.com/v1.0/me"           > "$tmp_me"  2>/dev/null &
+    local pid_me=$!
+    curl_get "$TOKEN_GRAPH" "https://graph.microsoft.com/v1.0/organization" > "$tmp_org" 2>/dev/null &
+    local pid_org=$!
+    wait "$pid_me" "$pid_org" 2>/dev/null || true
+
+    USER_ID=$(jq -r '.id // empty' "$tmp_me" 2>/dev/null)
+    if [[ -z "$USER_ID" ]]; then
+        rm -f "$tmp_me" "$tmp_org"
+        die "Failed to retrieve user ID — check \`az login\`"
     fi
 
-    USER_ID=$(echo "$user_json" | jq -r '.id')
-    if [[ -z "$USER_ID" || "$USER_ID" == "null" ]]; then
-        die "Failed to retrieve user ID from Azure AD"
-    fi
-
-    local org_json
-    org_json=$(az rest --method GET --url "https://graph.microsoft.com/v1.0/organization" 2>/dev/null) || true
     local tenant_name
-    tenant_name=$(echo "$org_json" | jq -r '.value[0].displayName // empty' 2>/dev/null) || tenant_name=""
-
+    tenant_name=$(jq -r '.value[0].displayName // empty' "$tmp_org" 2>/dev/null) || tenant_name=""
     if [[ -z "$tenant_name" ]]; then
-        local account_json
-        account_json=$(az account show 2>/dev/null) || true
-        tenant_name=$(echo "$account_json" | jq -r '.tenantDisplayName // .name // "unknown"' 2>/dev/null) || tenant_name="unknown"
+        # Fall back to tenantDisplayName in local az profile (never .name — that's the subscription)
+        tenant_name=$(jq -r '
+            .subscriptions[]? | select(.isDefault == true) | .tenantDisplayName // empty
+        ' ~/.azure/azureProfile.json 2>/dev/null | head -1) || tenant_name=""
     fi
+    [[ -z "$tenant_name" ]] && tenant_name="unknown"
+    rm -f "$tmp_me" "$tmp_org"
 
     printf "${GREEN}Logged in${NC} — Tenant: %s\n" "$tenant_name"
 }
@@ -136,8 +182,9 @@ iso_now() {
 load_subscription_lookup() {
     [[ -n "$CACHE_SUB_LOOKUP" ]] && return 0
 
+    # Read directly from local az CLI profile — no network call, no Python startup
     local subs_json
-    subs_json=$(az account list --output json 2>/dev/null) || return 1
+    subs_json=$(jq '.subscriptions // []' ~/.azure/azureProfile.json 2>/dev/null) || return 1
     CACHE_SUB_LOOKUP="$subs_json"
 }
 
@@ -223,8 +270,10 @@ format_arm_scope_label() {
 pim_list_eligible() {
     local category="$1"  # "aadroles" or "aadGroups"
     local result
-    if ! result=$(az rest --resource "$PIM_API" --method GET \
-        --url "$PIM_API/api/v2/privilegedAccess/$category/roleAssignments?\$filter=subjectId eq '$USER_ID' and assignmentState eq 'Eligible'&\$expand=roleDefinition(\$expand=resource)" \
+    if ! result=$(curl_get "$TOKEN_PIM" -G \
+        "$PIM_API/api/v2/privilegedAccess/$category/roleAssignments" \
+        --data-urlencode "\$filter=subjectId eq '$USER_ID' and assignmentState eq 'Eligible'" \
+        --data-urlencode "\$expand=roleDefinition(\$expand=resource)" \
         2>/dev/null); then
         printf "${RED}Error fetching eligible %s — check az login and PIM permissions${NC}\n" "$category" >&2
         return 1
@@ -235,8 +284,10 @@ pim_list_eligible() {
 arm_list_eligible() {
     local sub_id="$1"
     local result
-    if ! result=$(az rest --method GET \
-        --url "$ARM_API/subscriptions/$sub_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?\$filter=asTarget() and status eq 'Provisioned'&api-version=2020-10-01" \
+    if ! result=$(curl_get "$TOKEN_ARM" -G \
+        "$ARM_API/subscriptions/$sub_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances" \
+        --data-urlencode "\$filter=asTarget() and status eq 'Provisioned'" \
+        -d "api-version=2020-10-01" \
         2>/dev/null); then
         printf "${RED}Error fetching eligible ARM roles for subscription %s${NC}\n" "$sub_id" >&2
         return 1
@@ -246,8 +297,8 @@ arm_list_eligible() {
 
 arm_list_management_groups() {
     local result
-    if ! result=$(az rest --method GET \
-        --url "$ARM_API/providers/Microsoft.Management/managementGroups?api-version=2023-04-01" \
+    if ! result=$(curl_get "$TOKEN_ARM" \
+        "$ARM_API/providers/Microsoft.Management/managementGroups?api-version=2023-04-01" \
         2>/dev/null); then
         printf "${RED}Error fetching management groups — check az login and ARM permissions${NC}\n" >&2
         return 1
@@ -258,8 +309,10 @@ arm_list_management_groups() {
 arm_list_eligible_management_group() {
     local mg_id="$1"
     local result
-    if ! result=$(az rest --method GET \
-        --url "$ARM_API/providers/Microsoft.Management/managementGroups/$mg_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?\$filter=asTarget() and status eq 'Provisioned'&api-version=2020-10-01" \
+    if ! result=$(curl_get "$TOKEN_ARM" -G \
+        "$ARM_API/providers/Microsoft.Management/managementGroups/$mg_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances" \
+        --data-urlencode "\$filter=asTarget() and status eq 'Provisioned'" \
+        -d "api-version=2020-10-01" \
         2>/dev/null); then
         printf "${RED}Error fetching eligible ARM roles for management group %s${NC}\n" "$mg_id" >&2
         return 1
@@ -270,18 +323,25 @@ arm_list_eligible_management_group() {
 pim_list_active() {
     local category="$1"  # "aadroles" or "aadGroups"
     local result
-    result=$(az rest --resource "$PIM_API" --method GET \
-        --url "$PIM_API/api/v2/privilegedAccess/$category/roleAssignments?\$filter=subjectId eq '$USER_ID' and assignmentState eq 'Active'&\$expand=roleDefinition(\$expand=resource)" \
+    result=$(curl_get "$TOKEN_PIM" -G \
+        "$PIM_API/api/v2/privilegedAccess/$category/roleAssignments" \
+        --data-urlencode "\$filter=subjectId eq '$USER_ID' and assignmentState eq 'Active'" \
+        --data-urlencode "\$expand=roleDefinition(\$expand=resource)" \
         2>/dev/null) || { echo '{"value":[]}'; return 0; }
     echo "$result"
 }
 
 arm_list_active() {
     local subs management_groups arm_tmpdir
-    subs=$(az account list --query '[].id' -o tsv 2>/dev/null) || subs=""
-    management_groups=$(az rest --method GET \
-        --url "$ARM_API/providers/Microsoft.Management/managementGroups?api-version=2023-04-01" \
-        --query 'value[].name' -o tsv 2>/dev/null) || management_groups=""
+
+    # Read subscriptions from local az profile — no Python startup cost
+    load_subscription_lookup 2>/dev/null || true
+    subs=$(jq -r '.[].id // empty' <<< "${CACHE_SUB_LOOKUP:-[]}" 2>/dev/null) || subs=""
+
+    management_groups=$(curl_get "$TOKEN_ARM" \
+        "$ARM_API/providers/Microsoft.Management/managementGroups?api-version=2023-04-01" \
+        2>/dev/null | jq -r '.value[].name // empty' 2>/dev/null) || management_groups=""
+
     [[ -z "$subs" && -z "$management_groups" ]] && { echo '{"value":[]}'; return 0; }
 
     arm_tmpdir=$(mktemp -d)
@@ -291,9 +351,12 @@ arm_list_active() {
         [[ -z "$sub_id" ]] && continue
         scope_key=$(printf '%s' "$sub_id" | tr '/' '_')
         (
-            az rest --method GET \
-                --url "$ARM_API/subscriptions/$sub_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?\$filter=asTarget()&api-version=2020-10-01" \
-                > "$arm_tmpdir/subscription-$scope_key" 2>/dev/null || rm -f "$arm_tmpdir/subscription-$scope_key"
+            curl_get "$TOKEN_ARM" -G \
+                "$ARM_API/subscriptions/$sub_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances" \
+                --data-urlencode "\$filter=asTarget()" \
+                -d "api-version=2020-10-01" \
+                > "$arm_tmpdir/subscription-$scope_key" 2>/dev/null \
+                || rm -f "$arm_tmpdir/subscription-$scope_key"
         ) &
         pids+=($!)
     done <<< "$subs"
@@ -302,9 +365,12 @@ arm_list_active() {
         [[ -z "$mg_id" ]] && continue
         scope_key=$(printf '%s' "$mg_id" | tr '/' '_')
         (
-            az rest --method GET \
-                --url "$ARM_API/providers/Microsoft.Management/managementGroups/$mg_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?\$filter=asTarget()&api-version=2020-10-01" \
-                > "$arm_tmpdir/management-group-$scope_key" 2>/dev/null || rm -f "$arm_tmpdir/management-group-$scope_key"
+            curl_get "$TOKEN_ARM" -G \
+                "$ARM_API/providers/Microsoft.Management/managementGroups/$mg_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances" \
+                --data-urlencode "\$filter=asTarget()" \
+                -d "api-version=2020-10-01" \
+                > "$arm_tmpdir/management-group-$scope_key" 2>/dev/null \
+                || rm -f "$arm_tmpdir/management-group-$scope_key"
         ) &
         pids+=($!)
     done <<< "$management_groups"
@@ -352,9 +418,9 @@ pim_activate() {
           assignmentState:"Active",type:"UserAdd",reason:$reason,
           schedule:{type:"Once",startDateTime:$now,duration:$dur}}')
 
-    az rest --resource "$PIM_API" --method POST \
-        --url "$PIM_API/api/v2/privilegedAccess/$category/roleAssignmentRequests" \
-        --body "$payload" >/dev/null
+    curl_post "$TOKEN_PIM" \
+        "$PIM_API/api/v2/privilegedAccess/$category/roleAssignmentRequests" \
+        "$payload" >/dev/null
 }
 
 arm_activate() {
@@ -378,9 +444,9 @@ arm_activate() {
           justification:$just,scheduleInfo:{startDateTime:$now,
           expiration:{type:"AfterDuration",duration:$dur}}}}')
 
-    az rest --method PUT \
-        --url "${ARM_API}${scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${uuid}?api-version=2020-10-01" \
-        --body "$payload" >/dev/null
+    curl_put "$TOKEN_ARM" \
+        "${ARM_API}${scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${uuid}?api-version=2020-10-01" \
+        "$payload" >/dev/null
 }
 
 # -----------------------------------------------------------------------------
@@ -720,8 +786,9 @@ pick_azure_resource_scope() {
 }
 
 pick_subscriptions() {
-    local subs_json
-    if ! subs_json=$(az account list --output json 2>/dev/null); then
+    load_subscription_lookup 2>/dev/null || true
+    local subs_json="${CACHE_SUB_LOOKUP:-}"
+    if [[ -z "$subs_json" ]]; then
         printf "${RED}Error fetching subscriptions — check az login${NC}\n" >&2
         return 1
     fi
@@ -827,7 +894,7 @@ fetch_all_eligible_parallel() {
     ( pim_list_eligible "aadGroups" 2>/dev/null || echo '{"value":[]}' ) > "$tmpdir/groups.json" &
     pids+=($!)
 
-    ( az account list --query '[].id' -o tsv 2>/dev/null || true ) > "$tmpdir/sub_ids.txt" &
+    ( jq -r '.subscriptions[].id // empty' ~/.azure/azureProfile.json 2>/dev/null || true ) > "$tmpdir/sub_ids.txt" &
     pids+=($!)
 
     (
@@ -994,29 +1061,38 @@ flow_azure_resources_subscriptions() {
     local sub_ids
     sub_ids=$(pick_subscriptions) || return 1
 
-    local all_lines=""
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pids=() sub_ids_arr=()
+
     while IFS= read -r sub_id; do
         [[ -z "$sub_id" ]] && continue
-
-        local json
-        if ! json=$(arm_list_eligible "$sub_id"); then
-            continue  # warning already printed to stderr by arm_list_eligible
-        fi
-
-        local count
-        count=$(jq -r '.value | length' <<< "$json" 2>/dev/null) || count=0
-        (( count == 0 )) && continue
-
-        local lines
-        lines=$(format_arm_eligible "$json" "subscription" "/subscriptions/$sub_id" "$(lookup_subscription_name "$sub_id")")
-        [[ -z "$lines" ]] && continue
-
-        if [[ -z "$all_lines" ]]; then
-            all_lines="$lines"
-        else
-            all_lines+=$'\n'"$lines"
-        fi
+        sub_ids_arr+=("$sub_id")
+        local scope_key
+        scope_key=$(printf '%s' "$sub_id" | tr '/' '_')
+        (
+            local json count
+            json=$(arm_list_eligible "$sub_id" 2>/dev/null) || exit 0
+            count=$(jq '.value | length' <<< "$json" 2>/dev/null) || count=0
+            (( count == 0 )) && exit 0
+            format_arm_eligible "$json" "subscription" "/subscriptions/$sub_id" "$(lookup_subscription_name "$sub_id")"
+        ) > "$tmpdir/sub_${scope_key}.txt" &
+        pids+=($!)
     done <<< "$sub_ids"
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local all_lines=""
+    for f in "$tmpdir"/sub_*.txt; do
+        [[ -f "$f" ]] || continue
+        local content
+        content=$(<"$f")
+        [[ -z "$content" ]] && continue
+        [[ -z "$all_lines" ]] && all_lines="$content" || all_lines+=$'\n'"$content"
+    done
+    rm -rf "$tmpdir"
 
     if [[ -z "$all_lines" ]]; then
         printf "${YELLOW}No eligible assignments found for Azure Resources${NC}\n"
@@ -1039,29 +1115,37 @@ flow_azure_resources_management_groups() {
     local management_group_ids
     management_group_ids=$(pick_management_groups) || return 1
 
-    local all_lines=""
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pids=()
+
     while IFS= read -r management_group_id; do
         [[ -z "$management_group_id" ]] && continue
-
-        local json
-        if ! json=$(arm_list_eligible_management_group "$management_group_id"); then
-            continue  # warning already printed to stderr by arm_list_eligible_management_group
-        fi
-
-        local count
-        count=$(jq -r '.value | length' <<< "$json" 2>/dev/null) || count=0
-        (( count == 0 )) && continue
-
-        local lines
-        lines=$(format_arm_eligible "$json")
-        [[ -z "$lines" ]] && continue
-
-        if [[ -z "$all_lines" ]]; then
-            all_lines="$lines"
-        else
-            all_lines+=$'\n'"$lines"
-        fi
+        local scope_key
+        scope_key=$(printf '%s' "$management_group_id" | tr '/' '_')
+        (
+            local json count
+            json=$(arm_list_eligible_management_group "$management_group_id" 2>/dev/null) || exit 0
+            count=$(jq '.value | length' <<< "$json" 2>/dev/null) || count=0
+            (( count == 0 )) && exit 0
+            format_arm_eligible "$json"
+        ) > "$tmpdir/mg_${scope_key}.txt" &
+        pids+=($!)
     done <<< "$management_group_ids"
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local all_lines=""
+    for f in "$tmpdir"/mg_*.txt; do
+        [[ -f "$f" ]] || continue
+        local content
+        content=$(<"$f")
+        [[ -z "$content" ]] && continue
+        [[ -z "$all_lines" ]] && all_lines="$content" || all_lines+=$'\n'"$content"
+    done
+    rm -rf "$tmpdir"
 
     if [[ -z "$all_lines" ]]; then
         printf "${YELLOW}No eligible assignments found for Management Groups${NC}\n"
@@ -1204,6 +1288,7 @@ main() {
     trap 'kill "$PREFETCH_PID" 2>/dev/null; rm -f "$PREFETCH_FILE"; exit 0' INT TERM
 
     check_deps
+    load_tokens
     get_user_id
 
     while true; do
