@@ -1,0 +1,1301 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# pim-me-up — Fast Azure PIM activation from the terminal
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Constants & Configuration
+# -----------------------------------------------------------------------------
+
+PIM_API="https://api.azrbac.mspim.azure.com"
+ARM_API="https://management.azure.com"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+# Duration options (hours)
+DURATION_OPTIONS=("1h" "2h" "4h" "8h")
+
+# fzf configuration — dynamic height (~) requires fzf 0.30+
+if fzf --height=~1 </dev/null >/dev/null 2>&1; then
+    FZF_COMMON=(--height=~50% --border --margin=1,2 --ansi)
+else
+    FZF_COMMON=(--height=50% --border --margin=1,2 --ansi)
+fi
+FZF_SINGLE=("${FZF_COMMON[@]}" --no-multi)
+FZF_MULTI=("${FZF_COMMON[@]}" --multi --bind=tab:toggle,ctrl-a:toggle-all)
+
+# fzf headers — pass bare: fzf ... $FZF_HEADER_* (flag is part of the value)
+FZF_HEADER_CATEGORY="--header=Select PIM category (Esc to exit)"
+FZF_HEADER_ROLES="--header=Tab=select  Enter=confirm  Ctrl-A=all  Esc=back"
+FZF_HEADER_DURATION="--header=Select activation duration (Esc=back)"
+FZF_HEADER_SUBS="--header=Select subscriptions (Tab=toggle  Ctrl-A=all  Esc=back)"
+FZF_HEADER_AZURE_SCOPE="--header=Select Azure resource scope (Esc=back)"
+FZF_HEADER_MGS="--header=Select management groups (Tab=toggle  Ctrl-A=all  Esc=back)"
+
+# Session state
+USER_ID=""
+
+# Bearer tokens — fetched once in parallel at startup
+TOKEN_PIM=""    # for api.azrbac.mspim.azure.com
+TOKEN_ARM=""    # for management.azure.com
+TOKEN_GRAPH=""  # for graph.microsoft.com
+
+# Session caching — populated by Epic 2 stories
+CACHE_ENTRA=""     # cached eligible Entra ID Roles JSON
+CACHE_GROUPS=""    # cached eligible PIM Groups JSON
+CACHE_ARM_KIND=""  # cached Azure Resources branch for back-navigation
+CACHE_ARM_SUB=""   # cached Azure Resource role lines for subscription flow
+CACHE_ARM_MG=""    # cached Azure Resource role lines for management group flow
+CACHE_SUB_LOOKUP="" # cached subscription lookup JSON
+CACHE_ALL_FLAT=""  # cached flat list of all eligible roles (all categories combined)
+PREFETCH_PID=""    # PID of background prefetch job
+PREFETCH_FILE=""   # tmpfile written by background prefetch job
+
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
+
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    printf "${RED}Error: %s${NC}\n" "$msg" >&2
+    exit "$code"
+}
+
+check_deps() {
+    local missing=()
+    local deps=(fzf jq az curl)
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing required dependencies: $(IFS=', '; echo "${missing[*]}")"
+    fi
+}
+
+load_tokens() {
+    local tmp_pim tmp_arm tmp_graph
+    tmp_pim=$(mktemp); tmp_arm=$(mktemp); tmp_graph=$(mktemp)
+
+    az account get-access-token --resource "https://api.azrbac.mspim.azure.com" > "$tmp_pim" 2>/dev/null &
+    local pid_pim=$!
+    az account get-access-token --resource "https://management.azure.com"        > "$tmp_arm" 2>/dev/null &
+    local pid_arm=$!
+    az account get-access-token --resource "https://graph.microsoft.com"         > "$tmp_graph" 2>/dev/null &
+    local pid_graph=$!
+
+    wait "$pid_pim" "$pid_arm" "$pid_graph" 2>/dev/null || true
+
+    TOKEN_PIM=$(jq -r '.accessToken // empty'   "$tmp_pim"   2>/dev/null) || TOKEN_PIM=""
+    TOKEN_ARM=$(jq -r '.accessToken // empty'   "$tmp_arm"   2>/dev/null) || TOKEN_ARM=""
+    TOKEN_GRAPH=$(jq -r '.accessToken // empty' "$tmp_graph" 2>/dev/null) || TOKEN_GRAPH=""
+    rm -f "$tmp_pim" "$tmp_arm" "$tmp_graph"
+
+    if [[ -z "$TOKEN_PIM" || -z "$TOKEN_ARM" ]]; then
+        die "Failed to acquire access tokens — run \`az login\` first"
+    fi
+}
+
+# curl wrappers — curl_get TOKEN URL, curl_post TOKEN URL BODY, curl_put TOKEN URL BODY
+curl_get() {
+    curl -sf -H "Authorization: Bearer $1" -H "Content-Type: application/json" "${@:2}"
+}
+curl_post() {
+    curl -sf -X POST -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
+        -d "$3" "$2"
+}
+curl_put() {
+    curl -sf -X PUT -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
+        -d "$3" "$2"
+}
+
+get_user_id() {
+    # Fetch /me and /organization in parallel
+    local tmp_me tmp_org
+    tmp_me=$(mktemp); tmp_org=$(mktemp)
+    curl_get "$TOKEN_GRAPH" "https://graph.microsoft.com/v1.0/me"           > "$tmp_me"  2>/dev/null &
+    local pid_me=$!
+    curl_get "$TOKEN_GRAPH" "https://graph.microsoft.com/v1.0/organization" > "$tmp_org" 2>/dev/null &
+    local pid_org=$!
+    wait "$pid_me" "$pid_org" 2>/dev/null || true
+
+    USER_ID=$(jq -r '.id // empty' "$tmp_me" 2>/dev/null)
+    if [[ -z "$USER_ID" ]]; then
+        rm -f "$tmp_me" "$tmp_org"
+        die "Failed to retrieve user ID — check \`az login\`"
+    fi
+
+    local tenant_name
+    tenant_name=$(jq -r '.value[0].displayName // empty' "$tmp_org" 2>/dev/null) || tenant_name=""
+    if [[ -z "$tenant_name" ]]; then
+        # Fall back to tenantDisplayName in local az profile (never .name — that's the subscription)
+        tenant_name=$(jq -r '
+            .subscriptions[]? | select(.isDefault == true) | .tenantDisplayName // empty
+        ' ~/.azure/azureProfile.json 2>/dev/null | head -1) || tenant_name=""
+    fi
+    [[ -z "$tenant_name" ]] && tenant_name="unknown"
+    rm -f "$tmp_me" "$tmp_org"
+
+    printf "${GREEN}Logged in${NC} — Tenant: %s\n" "$tenant_name"
+}
+
+show_spinner() {
+    local pid="$1"
+    local message="$2"
+    local frames=('|' '/' '-' '\')
+    local i=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r%s %s" "$message" "${frames[i % ${#frames[@]}]}"
+        i=$(( i + 1 ))
+        sleep 0.1
+    done
+
+    wait "$pid"
+    local status=$?
+    printf "\r\033[K"
+    return "$status"
+}
+
+gen_uuid() {
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        uuidgen || die "Cannot generate UUID — install uuidgen or run on Linux"
+    fi
+}
+
+iso_now() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+load_subscription_lookup() {
+    [[ -n "$CACHE_SUB_LOOKUP" ]] && return 0
+
+    # Read directly from local az CLI profile — no network call, no Python startup
+    local subs_json
+    subs_json=$(jq '.subscriptions // []' ~/.azure/azureProfile.json 2>/dev/null) || return 1
+    CACHE_SUB_LOOKUP="$subs_json"
+}
+
+lookup_subscription_name() {
+    local sub_id="$1"
+    [[ -n "$sub_id" ]] || { printf "unknown"; return 0; }
+
+    load_subscription_lookup >/dev/null 2>&1 || true
+
+    local sub_name=""
+    if [[ -n "$CACHE_SUB_LOOKUP" ]]; then
+        sub_name=$(jq -r --arg id "$sub_id" 'map(select(.id == $id) | .name)[0] // empty' <<< "$CACHE_SUB_LOOKUP" 2>/dev/null)
+    fi
+
+    printf "%s" "${sub_name:-$sub_id}"
+}
+
+normalize_arm_scope_type() {
+    local scope_path="$1"
+    local scope_type="$2"
+    local scope_path_lower="${scope_path,,}"
+    local normalized_type
+    normalized_type=$(printf "%s" "$scope_type" | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$scope_path_lower" =~ ^/providers/microsoft\.management/managementgroups/[^/]+(/.*)?$ ]]; then
+        printf "managementgroup"
+    elif [[ "$scope_path_lower" =~ ^/subscriptions/[^/]+/resourcegroups/[^/]+$ ]]; then
+        printf "resourcegroup"
+    elif [[ "$scope_path_lower" =~ ^/subscriptions/[^/]+/resourcegroups/[^/]+/.+$ ]]; then
+        printf "resource"
+    elif [[ "$scope_path_lower" =~ ^/subscriptions/[^/]+$ ]]; then
+        printf "subscription"
+    elif [[ -n "$normalized_type" ]]; then
+        printf "%s" "$normalized_type"
+    else
+        printf ""
+    fi
+}
+
+format_arm_scope_label() {
+    local scope_path="$1"
+    local scope_type="$2"
+    local scope_name="$3"
+
+    local scope_path_lower="${scope_path,,}"
+    local resource_name=""
+    local rg_name=""
+    local normalized_type
+    local fallback_name=""
+    normalized_type=$(normalize_arm_scope_type "$scope_path" "$scope_type")
+    resource_name="${scope_path##*/}"
+
+    if [[ "$scope_path_lower" =~ /resourcegroups/([^/]+) ]]; then
+        rg_name="${BASH_REMATCH[1]}"
+    fi
+
+    fallback_name="${scope_name:-${resource_name:-unknown}}"
+
+    case "$normalized_type" in
+        managementgroup)
+            printf "MG: %s" "$fallback_name"
+            ;;
+        subscription)
+            printf "Sub: %s" "$fallback_name"
+            ;;
+        resourcegroup)
+            printf "RG: %s" "${rg_name:-$fallback_name}"
+            ;;
+        *)
+            if [[ -n "$rg_name" ]]; then
+                printf "%s / %s" "$rg_name" "${scope_name:-${resource_name:-unknown}}"
+            else
+                printf "%s" "${scope_name:-${resource_name:-unknown}}"
+            fi
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# API Functions
+# -----------------------------------------------------------------------------
+
+pim_list_eligible() {
+    local category="$1"  # "aadroles" or "aadGroups"
+    local result
+    if ! result=$(curl_get "$TOKEN_PIM" -G \
+        "$PIM_API/api/v2/privilegedAccess/$category/roleAssignments" \
+        --data-urlencode "\$filter=subjectId eq '$USER_ID' and assignmentState eq 'Eligible'" \
+        --data-urlencode "\$expand=roleDefinition(\$expand=resource)" \
+        2>/dev/null); then
+        printf "${RED}Error fetching eligible %s — check az login and PIM permissions${NC}\n" "$category" >&2
+        return 1
+    fi
+    echo "$result"
+}
+
+arm_list_eligible() {
+    local sub_id="$1"
+    local result
+    if ! result=$(curl_get "$TOKEN_ARM" -G \
+        "$ARM_API/subscriptions/$sub_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances" \
+        --data-urlencode "\$filter=asTarget() and status eq 'Provisioned'" \
+        -d "api-version=2020-10-01" \
+        2>/dev/null); then
+        printf "${RED}Error fetching eligible ARM roles for subscription %s${NC}\n" "$sub_id" >&2
+        return 1
+    fi
+    echo "$result"
+}
+
+arm_list_management_groups() {
+    local result
+    if ! result=$(curl_get "$TOKEN_ARM" \
+        "$ARM_API/providers/Microsoft.Management/managementGroups?api-version=2023-04-01" \
+        2>/dev/null); then
+        printf "${RED}Error fetching management groups — check az login and ARM permissions${NC}\n" >&2
+        return 1
+    fi
+    echo "$result"
+}
+
+arm_list_eligible_management_group() {
+    local mg_id="$1"
+    local result
+    if ! result=$(curl_get "$TOKEN_ARM" -G \
+        "$ARM_API/providers/Microsoft.Management/managementGroups/$mg_id/providers/Microsoft.Authorization/roleEligibilityScheduleInstances" \
+        --data-urlencode "\$filter=asTarget() and status eq 'Provisioned'" \
+        -d "api-version=2020-10-01" \
+        2>/dev/null); then
+        printf "${RED}Error fetching eligible ARM roles for management group %s${NC}\n" "$mg_id" >&2
+        return 1
+    fi
+    echo "$result"
+}
+
+pim_list_active() {
+    local category="$1"  # "aadroles" or "aadGroups"
+    local result
+    result=$(curl_get "$TOKEN_PIM" -G \
+        "$PIM_API/api/v2/privilegedAccess/$category/roleAssignments" \
+        --data-urlencode "\$filter=subjectId eq '$USER_ID' and assignmentState eq 'Active'" \
+        --data-urlencode "\$expand=roleDefinition(\$expand=resource)" \
+        2>/dev/null) || { echo '{"value":[]}'; return 0; }
+    echo "$result"
+}
+
+arm_list_active() {
+    local subs management_groups arm_tmpdir
+
+    # Read subscriptions from local az profile — no Python startup cost
+    load_subscription_lookup 2>/dev/null || true
+    subs=$(jq -r '.[].id // empty' <<< "${CACHE_SUB_LOOKUP:-[]}" 2>/dev/null) || subs=""
+
+    management_groups=$(curl_get "$TOKEN_ARM" \
+        "$ARM_API/providers/Microsoft.Management/managementGroups?api-version=2023-04-01" \
+        2>/dev/null | jq -r '.value[].name // empty' 2>/dev/null) || management_groups=""
+
+    [[ -z "$subs" && -z "$management_groups" ]] && { echo '{"value":[]}'; return 0; }
+
+    arm_tmpdir=$(mktemp -d)
+
+    local pids=() scope_key
+    while IFS= read -r sub_id; do
+        [[ -z "$sub_id" ]] && continue
+        scope_key=$(printf '%s' "$sub_id" | tr '/' '_')
+        (
+            curl_get "$TOKEN_ARM" -G \
+                "$ARM_API/subscriptions/$sub_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances" \
+                --data-urlencode "\$filter=asTarget()" \
+                -d "api-version=2020-10-01" \
+                > "$arm_tmpdir/subscription-$scope_key" 2>/dev/null \
+                || rm -f "$arm_tmpdir/subscription-$scope_key"
+        ) &
+        pids+=($!)
+    done <<< "$subs"
+
+    while IFS= read -r mg_id; do
+        [[ -z "$mg_id" ]] && continue
+        scope_key=$(printf '%s' "$mg_id" | tr '/' '_')
+        (
+            curl_get "$TOKEN_ARM" -G \
+                "$ARM_API/providers/Microsoft.Management/managementGroups/$mg_id/providers/Microsoft.Authorization/roleAssignmentScheduleInstances" \
+                --data-urlencode "\$filter=asTarget()" \
+                -d "api-version=2020-10-01" \
+                > "$arm_tmpdir/management-group-$scope_key" 2>/dev/null \
+                || rm -f "$arm_tmpdir/management-group-$scope_key"
+        ) &
+        pids+=($!)
+    done <<< "$management_groups"
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    if compgen -G "$arm_tmpdir/*" >/dev/null 2>&1; then
+        jq -s '
+            {
+                "value": (
+                    [.[].value[]]
+                    | unique_by(.id // (.properties.scope + "|" + .properties.roleDefinitionId + "|" + (.properties.startDateTime // "")))
+                )
+            }
+        ' "$arm_tmpdir"/* 2>/dev/null || echo '{"value":[]}'
+    else
+        echo '{"value":[]}'
+    fi
+
+    rm -rf "$arm_tmpdir"
+}
+
+pim_activate() {
+    local category="$1"       # "aadroles" or "aadGroups"
+    local role_def_id="$2"
+    local resource_id="$3"
+    local duration_hours="$4"  # "1h", "2h", etc.
+    local justification="$5"
+
+    local n="${duration_hours%h}"
+    local now
+    now=$(iso_now)
+
+    local payload
+    payload=$(jq -n \
+        --arg rdid "$role_def_id" \
+        --arg resid "$resource_id" \
+        --arg uid "$USER_ID" \
+        --arg reason "$justification" \
+        --arg dur "PT${n}H" \
+        --arg now "$now" \
+        '{roleDefinitionId:$rdid,resourceId:$resid,subjectId:$uid,
+          assignmentState:"Active",type:"UserAdd",reason:$reason,
+          schedule:{type:"Once",startDateTime:$now,duration:$dur}}')
+
+    curl_post "$TOKEN_PIM" \
+        "$PIM_API/api/v2/privilegedAccess/$category/roleAssignmentRequests" \
+        "$payload" >/dev/null
+}
+
+arm_activate() {
+    local scope="$1"
+    local role_def_id="$2"
+    local duration_hours="$3"
+    local justification="$4"
+
+    local n="${duration_hours%h}"
+    local uuid now payload
+    uuid=$(gen_uuid)
+    now=$(iso_now)
+
+    payload=$(jq -n \
+        --arg pid "$USER_ID" \
+        --arg rdid "$role_def_id" \
+        --arg just "$justification" \
+        --arg now "$now" \
+        --arg dur "PT${n}H" \
+        '{properties:{principalId:$pid,roleDefinitionId:$rdid,requestType:"SelfActivate",
+          justification:$just,scheduleInfo:{startDateTime:$now,
+          expiration:{type:"AfterDuration",duration:$dur}}}}')
+
+    curl_put "$TOKEN_ARM" \
+        "${ARM_API}${scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${uuid}?api-version=2020-10-01" \
+        "$payload" >/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# Display Formatting
+# -----------------------------------------------------------------------------
+
+format_entra_eligible() {
+    local json="$1"
+    jq -r '.value[] |
+        (.roleDefinition.displayName // "unknown") + "\u001b[2m | " +
+        (.roleDefinition.resource.displayName // "unknown") + "\u001b[0m" +
+        "\t" +
+        "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
+        "&resourceId=" + (.resourceId // "unknown")' <<< "$json" 2>/dev/null
+}
+
+format_groups_eligible() {
+    local json="$1"
+    jq -r '.value[] |
+        (.roleDefinition.resource.displayName // "unknown") + "\u001b[2m | " +
+        (.roleDefinition.displayName // "member") + "\u001b[0m" +
+        "\t" +
+        "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
+        "&resourceId=" + (.resourceId // "unknown")' <<< "$json" 2>/dev/null
+}
+
+format_entra_eligible_prefixed() {
+    local json="$1"
+    jq -r '.value[] |
+        "entra: " + (.roleDefinition.displayName // "unknown") + "\u001b[2m | " +
+        (.roleDefinition.resource.displayName // "unknown") + "\u001b[0m" +
+        "\t" +
+        "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
+        "&resourceId=" + (.resourceId // "unknown") +
+        "&pimcat=aadroles"' <<< "$json" 2>/dev/null
+}
+
+format_groups_eligible_prefixed() {
+    local json="$1"
+    jq -r '.value[] |
+        "grp: " + (.roleDefinition.resource.displayName // "unknown") + "\u001b[2m | " +
+        (.roleDefinition.displayName // "member") + "\u001b[0m" +
+        "\t" +
+        "roleDefinitionId=" + (.roleDefinitionId // "unknown") +
+        "&resourceId=" + (.resourceId // "unknown") +
+        "&pimcat=aadGroups"' <<< "$json" 2>/dev/null
+}
+
+format_arm_eligible() {
+    local json="$1"
+    local mode="${2:-direct}"
+    local selected_scope="${3:-}"
+    local selected_scope_name="${4:-}"
+
+    while IFS=$'\t' read -r role scope_type scope_name scope_path role_definition_id scope; do
+        local effective_scope_path="${scope:-$scope_path}"
+
+        local normalized_scope_type
+        normalized_scope_type=$(normalize_arm_scope_type "$effective_scope_path" "$scope_type")
+
+        local scope_label
+        scope_label=$(format_arm_scope_label "$effective_scope_path" "$scope_type" "$scope_name")
+
+        local activation_scope="$scope"
+        if [[ "$mode" == "subscription" && "$normalized_scope_type" == "managementgroup" && -n "$selected_scope" ]]; then
+            activation_scope="$selected_scope"
+            scope_label="${selected_scope_name:-unknown} [↑ ${scope_name:-MG}]"
+        fi
+
+        printf "%s\033[2m | %s\033[0m\troleDefinitionId=%s&scope=%s\n" \
+            "$role" "$scope_label" "$role_definition_id" "$activation_scope"
+    done < <(jq -r '.value[] |
+        [
+          (.properties.expandedProperties.roleDefinition.displayName // "unknown"),
+          (.properties.expandedProperties.scope.type // ""),
+          (.properties.expandedProperties.scope.displayName // ""),
+          (.properties.expandedProperties.scope.id // .properties.scope // ""),
+          (.properties.roleDefinitionId // ""),
+          (.properties.scope // "")
+        ] | @tsv' <<< "$json" 2>/dev/null)
+}
+
+format_arm_eligible_prefixed() {
+    local json="$1"
+    local mode="${2:-direct}"
+    local selected_scope="${3:-}"
+    local selected_scope_name="${4:-}"
+
+    while IFS=$'\t' read -r role scope_type scope_name scope_path role_definition_id scope; do
+        local effective_scope_path="${scope:-$scope_path}"
+
+        local normalized_scope_type
+        normalized_scope_type=$(normalize_arm_scope_type "$effective_scope_path" "$scope_type")
+
+        local scope_label
+        scope_label=$(format_arm_scope_label "$effective_scope_path" "$scope_type" "$scope_name")
+
+        local activation_scope="$scope"
+        if [[ "$mode" == "subscription" && "$normalized_scope_type" == "managementgroup" && -n "$selected_scope" ]]; then
+            activation_scope="$selected_scope"
+            scope_label="${selected_scope_name:-unknown} [↑ ${scope_name:-MG}]"
+        fi
+
+        local prefix
+        case "$normalized_scope_type" in
+            managementgroup) prefix="mgmt:" ;;
+            subscription)    prefix="sub:" ;;
+            resourcegroup)   prefix="rg:" ;;
+            *)               prefix="res:" ;;
+        esac
+
+        printf "%s %s\033[2m | %s\033[0m\troleDefinitionId=%s&scope=%s\n" \
+            "$prefix" "$role" "$scope_label" "$role_definition_id" "$activation_scope"
+    done < <(jq -r '.value[] |
+        [
+          (.properties.expandedProperties.roleDefinition.displayName // "unknown"),
+          (.properties.expandedProperties.scope.type // ""),
+          (.properties.expandedProperties.scope.displayName // ""),
+          (.properties.expandedProperties.scope.id // .properties.scope // ""),
+          (.properties.roleDefinitionId // ""),
+          (.properties.scope // "")
+        ] | @tsv' <<< "$json" 2>/dev/null)
+}
+
+localize_expiry_timestamps() {
+    local line utc local_time
+    while IFS= read -r line; do
+        if [[ "$line" =~ \[expires\ ([^]]+)\] ]]; then
+            utc="${BASH_REMATCH[1]}"
+            local_time=$(date -d "$utc" "+%Y-%m-%d %H:%M" 2>/dev/null) || local_time="${utc%%T*}"
+            line=$(sed "s|\[expires [^]]*\]|[expires ${local_time}]|" <<< "$line")
+        fi
+        printf '%s\n' "$line"
+    done
+}
+
+format_active_entra_roles() {
+    local json="$1"
+    jq -r '.value[] |
+        (.roleDefinition.displayName // empty) +
+        (if (.endDateTime // "") != "" then " [expires " + .endDateTime + "]" else "" end)' <<< "$json" 2>/dev/null
+}
+
+format_active_pim_groups() {
+    local json="$1"
+    jq -r '.value[] |
+        ((.roleDefinition.resource.displayName // .resource.displayName // .resourceId // "unknown") +
+        (if (.roleDefinition.displayName // "") != "" then " (" + .roleDefinition.displayName + ")" else "" end)) +
+        (if (.endDateTime // "") != "" then " [expires " + .endDateTime + "]" else "" end)' <<< "$json" 2>/dev/null
+}
+
+format_active_arm_roles() {
+    local json="$1"
+    jq -r '.value[]
+        | select((.properties.endDateTime // "") != "")
+        | (.properties.expandedProperties.roleDefinition.displayName // "unknown") + " (" +
+          (
+            if (.properties.expandedProperties.scope.type // "" | ascii_downcase) == "managementgroup" then
+                "MG: " + (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
+            elif (.properties.expandedProperties.scope.type // "" | ascii_downcase) == "subscription" then
+                "Sub: " + (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
+            elif (.properties.expandedProperties.scope.type // "" | ascii_downcase) == "resourcegroup" then
+                "RG: " + (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
+            else
+                (.properties.expandedProperties.scope.displayName // .properties.expandedProperties.scope.id // "unknown")
+            end
+          ) + ") [expires " + .properties.endDateTime + "]"' <<< "$json" 2>/dev/null
+}
+
+count_nonempty_lines() {
+    local lines="$1"
+    awk 'NF { count++ } END { print count + 0 }' <<< "$lines"
+}
+
+print_assignment_section() {
+    local label="$1"
+    local items="$2"
+    local count="$3"
+
+    (( count > 0 )) || return 0
+
+    printf "  %s (%d)\n" "$label" "$count"
+    while IFS= read -r item; do
+        [[ -n "$item" ]] || continue
+        printf "    - %s\n" "$item"
+    done <<< "$items"
+}
+
+show_active_assignments() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    pim_list_active "aadroles" > "$tmpdir/entra" 2>/dev/null &
+    local pid_entra=$!
+    pim_list_active "aadGroups" > "$tmpdir/groups" 2>/dev/null &
+    local pid_groups=$!
+    arm_list_active > "$tmpdir/arm" 2>/dev/null &
+    local pid_arm=$!
+
+    (
+        sleep 30
+        touch "$tmpdir/timed_out"
+        kill "$pid_entra" "$pid_groups" "$pid_arm" 2>/dev/null || true
+    ) &
+    local pid_killer=$!
+
+    wait "$pid_entra" "$pid_groups" "$pid_arm" 2>/dev/null || true
+    kill "$pid_killer" 2>/dev/null || true
+    wait "$pid_killer" 2>/dev/null || true
+
+    local timed_out=false
+    [[ -f "$tmpdir/timed_out" ]] && timed_out=true
+
+    local entra_json groups_json arm_json
+    entra_json=$(<"$tmpdir/entra")
+    groups_json=$(<"$tmpdir/groups")
+    arm_json=$(<"$tmpdir/arm")
+
+    rm -rf "$tmpdir"
+
+    local entra_names groups_names arm_names
+    entra_names=$(format_active_entra_roles "$entra_json" | localize_expiry_timestamps)
+    groups_names=$(format_active_pim_groups "$groups_json" | localize_expiry_timestamps)
+    arm_names=$(format_active_arm_roles "$arm_json" | localize_expiry_timestamps)
+
+    local entra_count groups_count arm_count total
+    entra_count=$(count_nonempty_lines "$entra_names")
+    groups_count=$(count_nonempty_lines "$groups_names")
+    arm_count=$(count_nonempty_lines "$arm_names")
+    total=$((entra_count + groups_count + arm_count))
+
+    $timed_out && printf "${YELLOW}Warning: fetch timed out after 30s — results may be incomplete${NC}\n"
+
+    if (( total == 0 )); then
+        echo "No active assignments"
+        return 0
+    fi
+
+    printf "${YELLOW}Active Assignments:${NC}\n"
+    print_assignment_section "Entra ID Roles" "$entra_names" "$entra_count"
+    print_assignment_section "PIM Groups" "$groups_names" "$groups_count"
+    print_assignment_section "Azure Resources" "$arm_names" "$arm_count"
+}
+
+show_active_assignments_view() {
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    show_active_assignments >"$tmpfile" 2>&1 &
+    local pid=$!
+
+    show_spinner "$pid" "Loading active assignments"
+    printf "\n"
+    cat "$tmpfile"
+    rm -f "$tmpfile"
+}
+
+pause_for_menu_return() {
+    printf "\nPress any key to return to categories..."
+    IFS= read -r -s -n1 _
+    # Drain any remaining bytes from an escape sequence (e.g. arrow keys send \033[A)
+    read -r -s -n2 -t 0.05 _ 2>/dev/null || true
+    printf "\n"
+}
+
+# -----------------------------------------------------------------------------
+# UI Flow Functions
+# -----------------------------------------------------------------------------
+
+pick_category() {
+    local selection
+    selection=$(printf '%s\n' \
+        "Entra ID Roles" \
+        "PIM Groups" \
+        "Azure Resources" \
+        "Active Assignments" \
+        "All Roles" \
+        | fzf "${FZF_SINGLE[@]}" "$FZF_HEADER_CATEGORY") || return 1
+    echo "$selection"
+}
+
+pick_roles() {
+    local lines="$1"
+    local prev_selections="${2:-}"
+
+    local fzf_input="$lines"
+    local bind_arg=""
+
+    # Sort previously-selected items to top and pre-toggle them via fzf start binding
+    if [[ -n "$prev_selections" && -n "$lines" ]]; then
+        local matched_count=0
+        local matched_lines="" other_lines=""
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if grep -qxF "$line" <<< "$prev_selections" 2>/dev/null; then
+                matched_count=$(( matched_count + 1 ))
+                matched_lines+="${line}"$'\n'
+            else
+                other_lines+="${line}"$'\n'
+            fi
+        done < <(printf '%s' "$lines")
+
+        if (( matched_count > 0 )); then
+            fzf_input="${matched_lines}${other_lines}"
+            # Generate start binding: toggle first matched_count items, then move cursor back up
+            local bind_seq="toggle"
+            for (( i=1; i<matched_count; i++ )); do
+                bind_seq+="+down+toggle"
+            done
+            for (( i=1; i<matched_count; i++ )); do
+                bind_seq+="+up"
+            done
+            bind_arg="--bind=start:${bind_seq}"
+        fi
+    fi
+
+    local selected
+    if [[ -n "$bind_arg" ]]; then
+        selected=$(printf '%s' "$fzf_input" | fzf "${FZF_MULTI[@]}" "$FZF_HEADER_ROLES" \
+            --with-nth=1 --delimiter=$'\t' "$bind_arg") || return 1
+    else
+        selected=$(printf '%s' "$fzf_input" | fzf "${FZF_MULTI[@]}" "$FZF_HEADER_ROLES" \
+            --with-nth=1 --delimiter=$'\t') || return 1
+    fi
+
+    echo "$selected"
+}
+
+pick_azure_resource_scope() {
+    local selected
+    selected=$(printf '%s\n' \
+        "Subscriptions" \
+        "Management Groups" \
+        | fzf "${FZF_SINGLE[@]}" "$FZF_HEADER_AZURE_SCOPE") || return 1
+    echo "$selected"
+}
+
+pick_subscriptions() {
+    load_subscription_lookup 2>/dev/null || true
+    local subs_json="${CACHE_SUB_LOOKUP:-}"
+    if [[ -z "$subs_json" ]]; then
+        printf "${RED}Error fetching subscriptions — check az login${NC}\n" >&2
+        return 1
+    fi
+
+    local count
+    count=$(jq 'length' <<< "$subs_json" 2>/dev/null) || count=0
+    if (( count == 0 )); then
+        printf "${YELLOW}No subscriptions found${NC}\n"
+        return 1
+    fi
+
+    local lines
+    lines=$(jq -r '.[] | (.name // "unknown") + " (" + (.id // "") + ")" + "\t" + (.id // "")' \
+        <<< "$subs_json" 2>/dev/null)
+
+    local selected
+    selected=$(printf '%s\n' "$lines" | fzf "${FZF_MULTI[@]}" "$FZF_HEADER_SUBS" \
+        --with-nth=1 --delimiter=$'\t') || return 1
+
+    if [[ -z "$selected" ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$selected" | cut -d$'\t' -f2
+}
+
+pick_management_groups() {
+    local management_groups_json
+    if ! management_groups_json=$(arm_list_management_groups); then
+        return 1
+    fi
+
+    local count
+    count=$(jq '(.value // []) | length' <<< "$management_groups_json" 2>/dev/null) || count=0
+    if (( count == 0 )); then
+        printf "${YELLOW}No management groups found${NC}\n"
+        return 1
+    fi
+
+    local lines
+    lines=$(jq -r '(.value // [])[] |
+        ((.properties.displayName // .displayName // .name // "unknown") + " (" + (.name // "") + ")" + "\t" + (.name // ""))' \
+        <<< "$management_groups_json" 2>/dev/null)
+
+    local selected
+    selected=$(printf '%s\n' "$lines" | fzf "${FZF_MULTI[@]}" "$FZF_HEADER_MGS" \
+        --with-nth=1 --delimiter=$'\t') || return 1
+
+    if [[ -z "$selected" ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$selected" | cut -d$'\t' -f2
+}
+
+pick_duration() {
+    local selected
+    selected=$(printf '%s\n' "${DURATION_OPTIONS[@]}" \
+        | fzf "${FZF_SINGLE[@]}" "$FZF_HEADER_DURATION") || return 1
+    echo "$selected"
+}
+
+get_justification() {
+    local role_count="${1:-}"
+    local count_hint=""
+    [[ -n "$role_count" ]] && count_hint=" ($role_count role(s) selected)"
+    local error_hint=""
+
+    while true; do
+        local header="Enter justification (required${count_hint}, Esc=back)"
+        [[ -n "$error_hint" ]] && header="${error_hint}"$'\n'"${header}"
+
+        local output
+        output=$(echo "" | fzf "${FZF_SINGLE[@]}" \
+            --header="$header" \
+            --print-query \
+            --disabled \
+            --prompt="Justification: ") || return 1
+
+        local reason
+        reason=$(printf '%s' "$output" | head -1)
+
+        if [[ -n "${reason//[[:space:]]/}" ]]; then
+            echo "$reason"
+            return 0
+        fi
+
+        error_hint="Justification cannot be empty."
+    done
+}
+
+fetch_all_eligible_parallel() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pids=()
+
+    # Three parallel calls: Entra roles, PIM groups, and all ARM eligible in one tenant-level query
+    ( pim_list_eligible "aadroles" 2>/dev/null || echo '{"value":[]}' ) > "$tmpdir/entra.json" &
+    pids+=($!)
+
+    ( pim_list_eligible "aadGroups" 2>/dev/null || echo '{"value":[]}' ) > "$tmpdir/groups.json" &
+    pids+=($!)
+
+    (
+        curl_get "$TOKEN_ARM" -G \
+            "$ARM_API/providers/Microsoft.Authorization/roleEligibilityScheduleInstances" \
+            --data-urlencode "\$filter=asTarget()" \
+            -d "api-version=2020-10-01" 2>/dev/null || echo '{"value":[]}'
+    ) > "$tmpdir/arm.json" &
+    pids+=($!)
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local all_lines="" entra_lines groups_lines arm_lines
+
+    [[ -f "$tmpdir/entra.json" ]]  && entra_lines=$(format_entra_eligible_prefixed  "$(<"$tmpdir/entra.json")")  || entra_lines=""
+    [[ -f "$tmpdir/groups.json" ]] && groups_lines=$(format_groups_eligible_prefixed "$(<"$tmpdir/groups.json")") || groups_lines=""
+    [[ -f "$tmpdir/arm.json" ]]    && arm_lines=$(format_arm_eligible_prefixed       "$(<"$tmpdir/arm.json")")    || arm_lines=""
+
+    [[ -n "$entra_lines" ]]  && all_lines+="${entra_lines}"$'\n'
+    [[ -n "$groups_lines" ]] && all_lines+="${groups_lines}"$'\n'
+    [[ -n "$arm_lines" ]]    && all_lines+="${arm_lines}"$'\n'
+
+    rm -rf "$tmpdir"
+
+    printf '%s' "$all_lines"
+}
+
+flow_all_roles() {
+    local prev_selections="${1:-}"
+
+    if [[ -n "$CACHE_ALL_FLAT" ]]; then
+        pick_roles "$CACHE_ALL_FLAT" "$prev_selections" || return 1
+        return 0
+    fi
+
+    # Use background prefetch if one was started; otherwise fetch now
+    if [[ -z "$PREFETCH_PID" ]]; then
+        PREFETCH_FILE=$(mktemp)
+        fetch_all_eligible_parallel > "$PREFETCH_FILE" &
+        PREFETCH_PID=$!
+    fi
+
+    if kill -0 "$PREFETCH_PID" 2>/dev/null; then
+        show_spinner "$PREFETCH_PID" "Fetching all eligible roles"
+    else
+        wait "$PREFETCH_PID" 2>/dev/null || true
+    fi
+
+    local all_lines
+    all_lines=$(<"$PREFETCH_FILE")
+    rm -f "$PREFETCH_FILE"
+    PREFETCH_PID=""
+    PREFETCH_FILE=""
+
+    if [[ -z "${all_lines//[[:space:]]/}" ]]; then
+        printf "${YELLOW}No eligible assignments found${NC}\n"
+        return 1
+    fi
+
+    CACHE_ALL_FLAT="$all_lines"
+    pick_roles "$all_lines" "$prev_selections" || return 1
+}
+
+flow_entra_roles() {
+    local prev_selections="${1:-}"
+
+    if [[ -z "$CACHE_ENTRA" ]]; then
+        local json
+        json=$(pim_list_eligible "aadroles") || return 1
+
+        local count
+        count=$(jq -r 'if .value then (.value | length) else 0 end' <<< "$json" 2>/dev/null) || count=0
+        if (( count == 0 )); then
+            printf "${YELLOW}No eligible assignments found for Entra ID Roles${NC}\n"
+            return 1
+        fi
+        CACHE_ENTRA="$json"
+    fi
+
+    local lines
+    lines=$(format_entra_eligible "$CACHE_ENTRA")
+    if [[ -z "$lines" ]]; then
+        printf "${YELLOW}No eligible assignments found for Entra ID Roles${NC}\n"
+        return 1
+    fi
+    pick_roles "$lines" "$prev_selections" || return 1
+}
+
+flow_pim_groups() {
+    local prev_selections="${1:-}"
+
+    if [[ -z "$CACHE_GROUPS" ]]; then
+        local json
+        json=$(pim_list_eligible "aadGroups") || return 1
+
+        local count
+        count=$(jq -r 'if .value then (.value | length) else 0 end' <<< "$json" 2>/dev/null) || count=0
+        if (( count == 0 )); then
+            printf "${YELLOW}No eligible assignments found for PIM Groups${NC}\n"
+            return 1
+        fi
+        CACHE_GROUPS="$json"
+    fi
+
+    local lines
+    lines=$(format_groups_eligible "$CACHE_GROUPS")
+    if [[ -z "$lines" ]]; then
+        printf "${YELLOW}No eligible assignments found for PIM Groups${NC}\n"
+        return 1
+    fi
+    pick_roles "$lines" "$prev_selections" || return 1
+}
+
+flow_azure_resources_subscriptions() {
+    local prev_selections="${1:-}"
+
+    if [[ -n "$prev_selections" && -n "$CACHE_ARM_SUB" ]]; then
+        pick_roles "$CACHE_ARM_SUB" "$prev_selections" || return 1
+        return 0
+    fi
+
+    local sub_ids
+    sub_ids=$(pick_subscriptions) || return 1
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pids=() sub_ids_arr=()
+
+    while IFS= read -r sub_id; do
+        [[ -z "$sub_id" ]] && continue
+        sub_ids_arr+=("$sub_id")
+        local scope_key
+        scope_key=$(printf '%s' "$sub_id" | tr '/' '_')
+        (
+            local json count
+            json=$(arm_list_eligible "$sub_id" 2>/dev/null) || exit 0
+            count=$(jq '.value | length' <<< "$json" 2>/dev/null) || count=0
+            (( count == 0 )) && exit 0
+            format_arm_eligible "$json" "subscription" "/subscriptions/$sub_id" "$(lookup_subscription_name "$sub_id")"
+        ) > "$tmpdir/sub_${scope_key}.txt" &
+        pids+=($!)
+    done <<< "$sub_ids"
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local all_lines=""
+    for f in "$tmpdir"/sub_*.txt; do
+        [[ -f "$f" ]] || continue
+        local content
+        content=$(<"$f")
+        [[ -z "$content" ]] && continue
+        [[ -z "$all_lines" ]] && all_lines="$content" || all_lines+=$'\n'"$content"
+    done
+    rm -rf "$tmpdir"
+
+    if [[ -z "$all_lines" ]]; then
+        printf "${YELLOW}No eligible assignments found for Azure Resources${NC}\n"
+        return 1
+    fi
+
+    CACHE_ARM_KIND="Subscriptions"
+    CACHE_ARM_SUB="$all_lines"
+    pick_roles "$all_lines" "$prev_selections" || return 1
+}
+
+flow_azure_resources_management_groups() {
+    local prev_selections="${1:-}"
+
+    if [[ -n "$prev_selections" && -n "$CACHE_ARM_MG" ]]; then
+        pick_roles "$CACHE_ARM_MG" "$prev_selections" || return 1
+        return 0
+    fi
+
+    local management_group_ids
+    management_group_ids=$(pick_management_groups) || return 1
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pids=()
+
+    while IFS= read -r management_group_id; do
+        [[ -z "$management_group_id" ]] && continue
+        local scope_key
+        scope_key=$(printf '%s' "$management_group_id" | tr '/' '_')
+        (
+            local json count
+            json=$(arm_list_eligible_management_group "$management_group_id" 2>/dev/null) || exit 0
+            count=$(jq '.value | length' <<< "$json" 2>/dev/null) || count=0
+            (( count == 0 )) && exit 0
+            format_arm_eligible "$json"
+        ) > "$tmpdir/mg_${scope_key}.txt" &
+        pids+=($!)
+    done <<< "$management_group_ids"
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local all_lines=""
+    for f in "$tmpdir"/mg_*.txt; do
+        [[ -f "$f" ]] || continue
+        local content
+        content=$(<"$f")
+        [[ -z "$content" ]] && continue
+        [[ -z "$all_lines" ]] && all_lines="$content" || all_lines+=$'\n'"$content"
+    done
+    rm -rf "$tmpdir"
+
+    if [[ -z "$all_lines" ]]; then
+        printf "${YELLOW}No eligible assignments found for Management Groups${NC}\n"
+        return 1
+    fi
+
+    CACHE_ARM_KIND="Management Groups"
+    CACHE_ARM_MG="$all_lines"
+    pick_roles "$all_lines" "$prev_selections" || return 1
+}
+
+flow_azure_resources() {
+    local prev_selections="${1:-}"
+    local selection_scope
+
+    if [[ -n "$prev_selections" && -n "$CACHE_ARM_KIND" ]]; then
+        selection_scope="$CACHE_ARM_KIND"
+    else
+        selection_scope=$(pick_azure_resource_scope) || return 1
+    fi
+
+    case "$selection_scope" in
+        "Subscriptions")
+            flow_azure_resources_subscriptions "$prev_selections" || return 1
+            ;;
+        "Management Groups")
+            flow_azure_resources_management_groups "$prev_selections" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Activation Orchestration
+# -----------------------------------------------------------------------------
+
+activate_batch() {
+    local category="$1"
+    local selections="$2"
+    local duration="$3"
+    local justification="$4"
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pids=() displays=()
+    local idx=0
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        local display meta
+        display=$(cut -d$'\t' -f1 <<< "$line")
+        meta=$(cut -d$'\t' -f2 <<< "$line")
+
+        local role_def_id="${meta%%&*}"
+        role_def_id="${role_def_id#roleDefinitionId=}"
+
+        displays+=("$display")
+        local result_file="$tmpdir/$idx"
+        (
+            local err="" ok=true
+            case "$category" in
+                "Entra ID Roles")
+                    local resource_id="${meta#*resourceId=}"
+                    err=$(pim_activate "aadroles" "$role_def_id" "$resource_id" "$duration" "$justification" 2>&1) || ok=false
+                    ;;
+                "PIM Groups")
+                    local resource_id="${meta#*resourceId=}"
+                    err=$(pim_activate "aadGroups" "$role_def_id" "$resource_id" "$duration" "$justification" 2>&1) || ok=false
+                    ;;
+                "Azure Resources")
+                    local scope="${meta#*scope=}"
+                    err=$(arm_activate "$scope" "$role_def_id" "$duration" "$justification" 2>&1) || ok=false
+                    ;;
+                "All Roles")
+                    if [[ "$meta" == *"&scope="* ]]; then
+                        local scope="${meta#*&scope=}"
+                        err=$(arm_activate "$scope" "$role_def_id" "$duration" "$justification" 2>&1) || ok=false
+                    else
+                        local resource_id pimcat
+                        resource_id="${meta#*resourceId=}"; resource_id="${resource_id%%&*}"
+                        pimcat="${meta#*pimcat=}"; pimcat="${pimcat%%&*}"
+                        err=$(pim_activate "$pimcat" "$role_def_id" "$resource_id" "$duration" "$justification" 2>&1) || ok=false
+                    fi
+                    ;;
+            esac
+            if $ok; then
+                printf "ok\n" > "$result_file"
+            else
+                printf "err\n%s" "$err" > "$result_file"
+            fi
+        ) &
+        pids+=($!)
+        idx=$(( idx + 1 ))
+    done <<< "$selections"
+
+    printf "\nActivating %d role(s) in parallel...\n" "${#pids[@]}"
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local had_failure=false
+    for (( i=0; i<${#displays[@]}; i++ )); do
+        printf "  %s... " "${displays[$i]}"
+        local result_file="$tmpdir/$i"
+        if [[ -f "$result_file" ]]; then
+            local status
+            status=$(head -1 "$result_file")
+            if [[ "$status" == "ok" ]]; then
+                printf "${GREEN}✓${NC}\n"
+            else
+                printf "${RED}✗${NC}\n"
+                local err
+                err=$(tail -n +2 "$result_file")
+                [[ -n "$err" ]] && printf "    ${RED}%s${NC}\n" "$err"
+                had_failure=true
+            fi
+        else
+            printf "${RED}✗ (no result)${NC}\n"
+            had_failure=true
+        fi
+    done
+
+    rm -rf "$tmpdir"
+
+    if $had_failure; then
+        printf "\n${YELLOW}Some activations failed. See errors above.${NC}\n"
+    else
+        printf "\n${GREEN}All activations successful.${NC}\n"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+    trap 'kill "$PREFETCH_PID" 2>/dev/null; rm -f "$PREFETCH_FILE"; exit 0' INT TERM
+
+    check_deps
+    load_tokens
+    get_user_id
+
+    while true; do
+        local category
+        category=$(pick_category) || exit 0
+
+        if [[ "$category" == "Active Assignments" ]]; then
+            show_active_assignments_view
+            pause_for_menu_return
+            continue
+        fi
+
+        local selected_roles="" duration="" justification=""
+        local step="roles"
+
+        while true; do
+            case "$step" in
+                "roles")
+                    local new_roles
+                    case "$category" in
+                        "All Roles")
+                            new_roles=$(flow_all_roles "$selected_roles") || break ;;
+                        "Entra ID Roles")
+                            new_roles=$(flow_entra_roles "$selected_roles") || break ;;
+                        "PIM Groups")
+                            new_roles=$(flow_pim_groups "$selected_roles") || break ;;
+                        "Azure Resources")
+                            new_roles=$(flow_azure_resources "$selected_roles") || break ;;
+                    esac
+                    selected_roles="$new_roles"
+                    step="duration"
+                    ;;
+                "duration")
+                    local new_duration
+                    new_duration=$(pick_duration) || { step="roles"; continue; }
+                    duration="$new_duration"
+                    step="justification"
+                    ;;
+                "justification")
+                    local new_justification role_count
+                    role_count=$(count_nonempty_lines "$selected_roles")
+                    new_justification=$(get_justification "$role_count") || { step="duration"; continue; }
+                    justification="$new_justification"
+                    step="activate"
+                    ;;
+                "activate")
+                    activate_batch "$category" "$selected_roles" "$duration" "$justification"
+                    break
+                    ;;
+            esac
+        done
+    done
+}
+
+main "$@"
