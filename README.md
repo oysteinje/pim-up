@@ -6,7 +6,7 @@ Activate Entra ID roles, PIM groups, and Azure resource roles — all with fuzzy
 
 ## Features
 
-- **Four menu categories**: Active Assignments, Entra ID Roles, PIM Groups, Azure Resources
+- **Five menu categories**: Active Assignments, Entra ID Roles, PIM Groups, Azure Resources, All Roles
 - **Azure Resources split view**: Choose `Subscriptions` or `Management Groups`
 - **Fuzzy search**: Find roles instantly with fzf
 - **Multi-select**: Activate multiple roles at once (Tab to select)
@@ -20,6 +20,20 @@ Activate Entra ID roles, PIM groups, and Azure resource roles — all with fuzzy
 - [jq](https://jqlang.github.io/jq/)
 - [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) (`az`)
 - `curl`
+- Bash 4+
+
+## Supported environments
+
+- Linux
+- macOS with a modern Bash installation
+
+Windows is not currently supported.
+
+## Runtime assumptions
+
+- You are already authenticated with `az login`
+- Azure CLI has a readable local profile at `~/.azure/azureProfile.json`
+- `pim-me-up` uses your existing Azure CLI session and does not store credentials
 
 ## Install
 
@@ -38,14 +52,14 @@ install -m 755 pim-me-up/pim-me-up ~/.local/bin/pim-me-up
 ## Usage
 
 ```bash
-# Make sure you're logged in
+# Make sure you're logged in first
 az login
 
 # Run it
 pim-me-up
 ```
 
-1. Select category (`Active Assignments`, `Entra ID Roles`, `PIM Groups`, `Azure Resources`, or `All Resources`)
+1. Select category (`Active Assignments`, `Entra ID Roles`, `PIM Groups`, `Azure Resources`, or `All Roles`)
 2. If you choose `Azure Resources`, pick `Subscriptions` or `Management Groups`
 3. If you choose `Active Assignments`, the tool shows your current assignments and returns you to the category picker
 4. If you choose an activation category, search and select roles (Space for multi-select, Enter to confirm)
@@ -64,4 +78,4 @@ Authentication piggybacks on your Azure CLI session (`az account get-access-toke
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

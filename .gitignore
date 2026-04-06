@@ -1,0 +1,9 @@
+.claude/
+.devbox/
+_bmad/
+_bmad-output/
+
+.DS_Store
+*.swp
+*.swo
+*~

@@ -1,1 +1,0 @@
-- Perfomance / speed of the script is a priority

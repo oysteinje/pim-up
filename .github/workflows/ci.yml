@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  bash-sanity:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify scripts parse
+        run: |
+          bash -n ./pim-me-up
+          bash -n ./install.sh
+
+      - name: Verify installer help
+        run: bash ./install.sh --help >/dev/null
