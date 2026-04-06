@@ -183,8 +183,18 @@ load_subscription_lookup() {
     [[ -n "$CACHE_SUB_LOOKUP" ]] && return 0
 
     # Read directly from local az CLI profile — no network call, no Python startup
-    local subs_json
-    subs_json=$(jq '.subscriptions // []' ~/.azure/azureProfile.json 2>/dev/null) || return 1
+    # Filter to only subscriptions belonging to the active (default) tenant
+    local subs_json active_tenant
+    active_tenant=$(jq -r '.subscriptions[]? | select(.isDefault == true) | .tenantId // empty' \
+        ~/.azure/azureProfile.json 2>/dev/null | head -1) || active_tenant=""
+
+    if [[ -n "$active_tenant" ]]; then
+        subs_json=$(jq --arg tid "$active_tenant" \
+            '[.subscriptions[]? | select(.tenantId == $tid)]' \
+            ~/.azure/azureProfile.json 2>/dev/null) || return 1
+    else
+        subs_json=$(jq '.subscriptions // []' ~/.azure/azureProfile.json 2>/dev/null) || return 1
+    fi
     CACHE_SUB_LOOKUP="$subs_json"
 }
 
