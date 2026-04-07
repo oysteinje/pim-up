@@ -39,14 +39,25 @@ Windows is not currently supported.
 
 ## Install
 
+### Quick install (user-local)
+
 ```bash
-# Quick install (user-local)
 curl -fsSL https://raw.githubusercontent.com/oysteinje/pim-up/main/install.sh | bash
+```
 
-# System-wide install
+Installs to `~/.local/bin/pim-up`.
+
+### System-wide install
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/oysteinje/pim-up/main/install.sh | bash -s -- --system
+```
 
-# Manual install
+Installs to `/usr/local/bin/pim-up`. Requires `sudo`.
+
+### Manual install
+
+```bash
 git clone https://github.com/oysteinje/pim-up.git
 install -m 755 pim-up/pim-up ~/.local/bin/pim-up
 ```
