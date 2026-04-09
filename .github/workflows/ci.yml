@@ -13,7 +13,7 @@ jobs:
 
       - name: Verify scripts parse
         run: |
-          bash -n ./pim-up
+          bash -n ./pim-me-up
           bash -n ./install.sh
 
       - name: Verify installer help

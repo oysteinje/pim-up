@@ -1,10 +1,10 @@
-# pim-up
+# pim-me-up
 
 Fast Azure PIM elevation from your terminal using fzf (within the limits of the PIM API, which can be quite slow).
 
 Activate Entra ID roles, PIM groups, and Azure resource roles — all with fuzzy search and multi-select.
 
-![pim-up screenshot](assets/screenshot.png)
+![pim-me-up screenshot](assets/screenshot.png)
 
 ## Features
 
@@ -35,31 +35,31 @@ Windows is not currently supported.
 
 - You are already authenticated with `az login`
 - Azure CLI has a readable local profile at `~/.azure/azureProfile.json`
-- `pim-up` uses your existing Azure CLI session and does not store credentials
+- `pim-me-up` uses your existing Azure CLI session and does not store credentials
 
 ## Install
 
 ### Quick install (user-local)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oysteinje/pim-up/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/oysteinje/pim-me-up/main/install.sh | bash
 ```
 
-Installs to `~/.local/bin/pim-up`.
+Installs to `~/.local/bin/pim-me-up`.
 
 ### System-wide install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oysteinje/pim-up/main/install.sh | bash -s -- --system
+curl -fsSL https://raw.githubusercontent.com/oysteinje/pim-me-up/main/install.sh | bash -s -- --system
 ```
 
-Installs to `/usr/local/bin/pim-up`. Requires `sudo`.
+Installs to `/usr/local/bin/pim-me-up`. Requires `sudo`.
 
 ### Manual install
 
 ```bash
-git clone https://github.com/oysteinje/pim-up.git
-install -m 755 pim-up/pim-up ~/.local/bin/pim-up
+git clone https://github.com/oysteinje/pim-me-up.git
+install -m 755 pim-me-up/pim-me-up ~/.local/bin/pim-me-up
 ```
 
 ## Usage
@@ -69,7 +69,7 @@ install -m 755 pim-up/pim-up ~/.local/bin/pim-up
 az login
 
 # Run it
-pim-up
+pim-me-up
 ```
 
 1. Select category (`Active Assignments`, `Entra ID Roles`, `PIM Groups`, `Azure Resources`, or `All Roles`)
