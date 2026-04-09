@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_RAW_BASE="https://raw.githubusercontent.com/oysteinje/pim-up"
+REPO_RAW_BASE="https://raw.githubusercontent.com/oysteinje/pim-me-up"
 REF="main"
 TARGET_DIR="${HOME}/.local/bin"
 SYSTEM_INSTALL=0
-SCRIPT_NAME="pim-up"
+SCRIPT_NAME="pim-me-up"
 
 usage() {
     cat <<'EOF'
